@@ -1,0 +1,2 @@
+# Hi\xe7bir d\u0131\u015f paket gerekmez - app.py sadece Python stdlib kullan\u0131r.
+# Bu dosya Render'\u0131n Python projesi olarak tan\u0131mas\u0131 i\xe7in burada.
