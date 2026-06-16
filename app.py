@@ -1,5 +1,5 @@
 """
-L/S DIVERGENCE SCREENER (v1)
+L/S DIVERGENCE SCREENER (v2)
 =============================
 Binance futures'taki TUM USDT coinleri tarar; account(kalabalik) vs
 position(para) ayrismasi yasayanlari kademeli olarak listeler.
@@ -135,6 +135,34 @@ def _fetch_pair(sym, period):
     }
 
 
+def fetch_series(sym, period, limit=48):
+    """Bir coin icin account + position zaman serisi (grafik icin).
+    Donus: {ok, account:[{t,v}], position:[{t,v}]} veya {ok:False}."""
+    symbol = sym.upper()
+    if not symbol.endswith("USDT"):
+        symbol += "USDT"
+    acc_series = []
+    pos_series = []
+    try:
+        j = http_get(f"https://fapi.binance.com/futures/data/globalLongShortAccountRatio?symbol={symbol}&period={period}&limit={limit}")
+        if isinstance(j, list):
+            for d in j:
+                acc_series.append({"t": int(d["timestamp"]), "v": round(float(d["longAccount"]) * 100, 2)})
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+    try:
+        j = http_get(f"https://fapi.binance.com/futures/data/topLongShortPositionRatio?symbol={symbol}&period={period}&limit={limit}")
+        if isinstance(j, list):
+            for d in j:
+                pos_series.append({"t": int(d["timestamp"]), "v": round(float(d["longAccount"]) * 100, 2)})
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+    if not acc_series or not pos_series:
+        return {"ok": False, "error": "veri yok"}
+    return {"ok": True, "symbol": sym.replace("USDT", ""), "period": period,
+            "account": acc_series, "position": pos_series}
+
+
 def _label(diff):
     a = abs(diff)
     if a >= 15: level = "GUCLU"
@@ -215,6 +243,7 @@ SCREENER_HTML = '''<!DOCTYPE html>
 <meta name="theme-color" content="#0a0e0d">
 <title>L/S Divergence Screener</title>
 <link rel="manifest" href="/manifest.json">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.0/chart.umd.min.js"></script>
 <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;700&family=Major+Mono+Display&display=swap" rel="stylesheet">
 <style>
 :root {
@@ -241,46 +270,60 @@ padding-bottom:16px; border-bottom:1px solid var(--border); margin-bottom:18px; 
 .theme-btn { background:transparent; border:1px solid var(--border-strong); color:var(--text);
 font-size:15px; width:34px; height:34px; cursor:pointer; border-radius:0; }
 .theme-btn:hover { border-color:var(--text-dim); }
-.controls { display:flex; gap:10px; align-items:center; margin-bottom:16px; flex-wrap:wrap; }
+.controls { display:flex; gap:10px; align-items:center; margin-bottom:14px; flex-wrap:wrap; }
 .tabs { display:flex; gap:4px; }
 .tabs button { background:transparent; border:1px solid var(--border); color:var(--text-dim);
 font-family:inherit; font-size:12px; padding:8px 18px; cursor:pointer; letter-spacing:0.08em; border-radius:0; }
 .tabs button.active { background:var(--green); color:var(--bg); border-color:var(--green); font-weight:700; }
+.search { flex:1; min-width:130px; background:var(--bg-2); border:1px solid var(--border); color:var(--text);
+font-family:inherit; font-size:12px; padding:8px 12px; border-radius:0; }
+.search:focus { outline:none; border-color:var(--green); }
+.filter-btn { background:transparent; border:1px solid var(--border-strong); color:var(--text-dim);
+font-family:inherit; font-size:11px; padding:8px 14px; cursor:pointer; letter-spacing:0.05em; border-radius:0; white-space:nowrap; }
+.filter-btn.active { background:var(--accent); color:var(--bg); border-color:var(--accent); font-weight:700; }
 .refresh-btn { background:transparent; border:1px solid var(--border-strong); color:var(--text);
-font-family:inherit; font-size:11px; padding:8px 14px; cursor:pointer; letter-spacing:0.08em; border-radius:0; margin-left:auto; }
+font-family:inherit; font-size:11px; padding:8px 14px; cursor:pointer; letter-spacing:0.05em; border-radius:0; white-space:nowrap; }
 .refresh-btn:hover { border-color:var(--green); color:var(--green); }
 .status { font-size:11px; color:var(--text-dim); margin-bottom:14px; min-height:16px; }
 .status .scanning { color:var(--amber); }
 .status .err { color:var(--red); }
-.legend { display:flex; gap:14px; flex-wrap:wrap; margin-bottom:14px; font-size:10px; color:var(--text-dim); }
-.legend span { display:flex; align-items:center; gap:5px; }
-.dot { width:8px; height:8px; border-radius:50%; display:inline-block; }
-.dot.guclu { background:var(--red); box-shadow:0 0 6px var(--red); }
-.dot.orta { background:var(--amber); }
-.dot.hafif { background:var(--text-dim); }
-.dot.conflict { background:var(--accent); box-shadow:0 0 6px var(--accent); }
 table { width:100%; border-collapse:collapse; font-size:12px; }
 thead th { text-align:right; padding:8px 10px; color:var(--text-dim); font-size:10px;
-letter-spacing:0.1em; text-transform:uppercase; border-bottom:1px solid var(--border); font-weight:500; }
+letter-spacing:0.08em; text-transform:uppercase; border-bottom:1px solid var(--border); font-weight:500;
+cursor:pointer; user-select:none; white-space:nowrap; }
+thead th:hover { color:var(--text); }
 thead th.l { text-align:left; }
+thead th .arr { color:var(--green); font-size:9px; margin-left:2px; }
 tbody td { padding:9px 10px; text-align:right; border-bottom:1px solid var(--border); }
 tbody td.l { text-align:left; }
-tbody tr:hover { background:var(--bg-2); }
+tbody tr.data-row { cursor:pointer; }
+tbody tr.data-row:hover { background:var(--bg-2); }
+tbody tr.data-row.open { background:var(--bg-2); }
 .coin { font-weight:700; font-size:13px; letter-spacing:0.03em; }
+.coin .caret { color:var(--text-faint); font-size:9px; margin-right:5px; display:inline-block; transition:transform 0.2s; }
+tr.open .coin .caret { transform:rotate(90deg); color:var(--green); }
 .acc { color:var(--text-dim); }
 .pos { color:var(--amber); }
 .div-pos { color:var(--green); font-weight:700; }
 .div-neg { color:var(--red); font-weight:700; }
 .fund-pos { color:var(--green); }
 .fund-neg { color:var(--red); }
-.tag { display:inline-block; font-size:9px; padding:2px 7px; border:1px solid; letter-spacing:0.05em; white-space:nowrap; }
+.lvl { font-size:10px; letter-spacing:0.05em; }
+.lvl.GUCLU { color:var(--red); font-weight:700; }
+.lvl.ORTA { color:var(--amber); }
+.lvl.HAFIF { color:var(--text-dim); }
+.tag { display:inline-block; font-size:9px; padding:2px 7px; border:1px solid; letter-spacing:0.04em; white-space:nowrap; }
 .tag.whale-long { color:var(--green); border-color:var(--green); }
 .tag.whale-short { color:var(--red); border-color:var(--red); }
-.tag-level { font-size:9px; color:var(--text-faint); margin-left:5px; }
 .conflict-badge { display:inline-block; font-size:9px; padding:2px 6px; margin-left:6px;
 background:var(--accent); color:var(--bg); font-weight:700; letter-spacing:0.03em; }
-.section-row td { background:var(--bg-2); color:var(--text-dim); font-size:10px;
-letter-spacing:0.15em; text-transform:uppercase; padding:7px 10px; font-weight:700; border-bottom:1px solid var(--border-strong); }
+.chart-row td { padding:0; border-bottom:1px solid var(--border-strong); background:var(--bg); }
+.chart-box { padding:16px 10px; }
+.chart-box.loading { text-align:center; color:var(--text-faint); padding:30px; font-size:11px; }
+.chart-canvas-wrap { position:relative; height:240px; }
+.chart-legend { display:flex; gap:18px; justify-content:center; margin-top:10px; font-size:10px; color:var(--text-dim); }
+.chart-legend span { display:flex; align-items:center; gap:5px; }
+.lg-line { width:16px; height:2px; display:inline-block; }
 .empty { text-align:center; color:var(--text-faint); padding:40px 0; font-size:12px; }
 .spin { display:inline-block; animation:spin 1s linear infinite; }
 @keyframes spin { to { transform:rotate(360deg); } }
@@ -291,9 +334,10 @@ font-size:11px; color:var(--text-dim); line-height:1.7; }
 .wrap { padding:14px; }
 thead th.hide-m, tbody td.hide-m { display:none; }
 .logo { font-size:15px; }
-tbody td { padding:8px 6px; font-size:11px; }
-thead th { padding:7px 6px; }
-.tabs button { padding:8px 14px; }
+tbody td { padding:8px 5px; font-size:11px; }
+thead th { padding:7px 5px; font-size:9px; }
+.tabs button { padding:8px 13px; }
+.chart-canvas-wrap { height:200px; }
 }
 </style>
 </head>
@@ -315,45 +359,48 @@ thead th { padding:7px 6px; }
 <button data-period="15m">15M</button>
 <button data-period="1h" class="active">1H</button>
 </div>
+<input type="text" class="search" id="search" placeholder="Coin ara (orn. BTC)...">
+<button class="filter-btn" id="conflictBtn" title="Sadece funding celiskisi">&#9889; CELISKI</button>
 <button class="refresh-btn" id="refreshBtn">&#8635; YENILE</button>
 </div>
 
 <div class="status" id="status">Yukleniyor...</div>
 
-<div class="legend">
-<span><span class="dot guclu"></span>GUCLU (15+)</span>
-<span><span class="dot orta"></span>ORTA (10-15)</span>
-<span><span class="dot hafif"></span>HAFIF (5-10)</span>
-<span><span class="dot conflict"></span>FUNDING CELISKISI</span>
-</div>
-
 <table>
 <thead>
-<tr>
-<th class="l">COIN</th>
-<th class="hide-m">HESAP</th>
-<th class="hide-m">POZISYON</th>
-<th>AYRISMA</th>
-<th class="hide-m">FUNDING</th>
-<th class="l">ETIKET</th>
+<tr id="headrow">
+<th class="l" data-sort="symbol">COIN<span class="arr"></span></th>
+<th class="hide-m" data-sort="account">HESAP<span class="arr"></span></th>
+<th class="hide-m" data-sort="position">POZISYON<span class="arr"></span></th>
+<th data-sort="absdiv">AYRISMA<span class="arr">&#9660;</span></th>
+<th class="hide-m" data-sort="funding">FUNDING<span class="arr"></span></th>
+<th data-sort="level">SEVIYE<span class="arr"></span></th>
+<th class="l hide-m">ETIKET</th>
 </tr>
 </thead>
 <tbody id="tbody">
-<tr><td colspan="6" class="empty">Yukleniyor...</td></tr>
+<tr><td colspan="7" class="empty">Yukleniyor...</td></tr>
 </tbody>
 </table>
 
 <div class="info">
-<b>NE ISE YARAR?</b> Binance futures'taki tum USDT coinleri tarar; <b>account (kalabalik)</b> ile <b>position (para/top trader)</b> arasinda ayrisma yasayanlari listeler.<br><br>
-&bull; <b>AYRISMA = position - account.</b> Pozitif = para kalabaliktan daha long (whale long, retail short).<br>
-&bull; <b>FUNDING CELISKISI</b> (turkuaz): para yonu ile funding ters. Orn. whale long ama funding negatif - en dikkat cekici sinyal.<br>
-&bull; Sadece |ayrisma| >= 5 olanlar gosterilir. 30dk'da bir otomatik taranir.<br>
-&bull; Veri Binance public API (weight=0 endpoint'ler). Bu arac finansal tavsiye degildir.
+<b>NE ISE YARAR?</b> Tum USDT futures coinlerinde <b>account (kalabalik)</b> vs <b>position (para/top trader)</b> ayrismasini tarar.<br><br>
+&bull; <b>AYRISMA = position - account.</b> Pozitif = para kalabaliktan daha long (whale long).<br>
+&bull; <b>&#9889; CELISKI</b> butonu: para yonu funding'le ters olanlari suzer (en dikkat cekici sinyal).<br>
+&bull; Kolon basliklarina tiklayarak sirala. Coine tiklayarak grafigini ac.<br>
+&bull; |ayrisma| >= 5 olanlar; 30dk'da bir taranir. Finansal tavsiye degildir.
 </div>
 </div>
 <script>
 let currentPeriod = '1h';
 let pollTimer = null;
+let allResults = [];
+let sortKey = 'absdiv';
+let sortDir = 'desc';
+let searchTerm = '';
+let conflictOnly = false;
+let openCoin = null;
+let chartInstance = null;
 
 function z(n){ return String(n).padStart(2,'0'); }
 
@@ -372,6 +419,7 @@ function applyTheme(light) {
   document.getElementById('themeBtn').innerHTML = light ? '☀' : '☽';
   document.querySelector('meta[name=theme-color]').setAttribute('content', light ? '#f4f6f5' : '#0a0e0d');
   try { localStorage.setItem('scr_theme', light ? 'light' : 'dark'); } catch {}
+  if (chartInstance && openCoin) { drawChart(openCoin._lastSeries); }
 }
 document.getElementById('themeBtn').addEventListener('click', () => {
   applyTheme(!document.body.classList.contains('light'));
@@ -385,54 +433,152 @@ function fmtAge(ts) {
   if (sec < 3600) return Math.floor(sec/60) + 'dk once';
   return Math.floor(sec/3600) + 'sa once';
 }
-
 function fmtFunding(f) {
   if (f == null) return {t:'—', c:''};
   const s = f >= 0 ? '+' : '';
   return {t: s + f.toFixed(4) + '%', c: f > 0 ? 'fund-pos' : (f < 0 ? 'fund-neg' : '')};
 }
 
-function render(data) {
-  const tbody = document.getElementById('tbody');
-  const status = document.getElementById('status');
+const LEVEL_ORDER = { GUCLU:3, ORTA:2, HAFIF:1 };
 
+function sortRows(rows) {
+  const dir = sortDir === 'asc' ? 1 : -1;
+  return rows.slice().sort((a, b) => {
+    let va, vb;
+    switch (sortKey) {
+      case 'symbol': va = a.symbol; vb = b.symbol; return va.localeCompare(vb) * dir;
+      case 'account': va = a.account; vb = b.account; break;
+      case 'position': va = a.position; vb = b.position; break;
+      case 'absdiv': va = Math.abs(a.divergence); vb = Math.abs(b.divergence); break;
+      case 'funding': va = a.funding==null?-999:a.funding; vb = b.funding==null?-999:b.funding; break;
+      case 'level': va = LEVEL_ORDER[a.level]||0; vb = LEVEL_ORDER[b.level]||0;
+                    if (va===vb){ return (Math.abs(b.divergence)-Math.abs(a.divergence)); } break;
+      default: va = Math.abs(a.divergence); vb = Math.abs(b.divergence);
+    }
+    return (va - vb) * dir;
+  });
+}
+
+function visibleRows() {
+  let rows = allResults;
+  if (conflictOnly) rows = rows.filter(r => r.fundingConflict);
+  if (searchTerm) rows = rows.filter(r => r.symbol.toLowerCase().includes(searchTerm));
+  return sortRows(rows);
+}
+
+function renderTable() {
+  const tbody = document.getElementById('tbody');
+  const rows = visibleRows();
+  if (rows.length === 0) {
+    tbody.innerHTML = `<tr><td colspan="7" class="empty">${allResults.length ? 'Filtreye uyan coin yok' : 'Ayrisan coin bulunamadi'}</td></tr>`;
+    return;
+  }
+  let html = '';
+  for (const r of rows) {
+    const f = fmtFunding(r.funding);
+    const divCls = r.divergence > 0 ? 'div-pos' : 'div-neg';
+    const divSign = r.divergence > 0 ? '+' : '';
+    const tagCls = r.divergence > 0 ? 'whale-long' : 'whale-short';
+    const conflict = r.fundingConflict ? '<span class="conflict-badge">⚡</span>' : '';
+    const isOpen = openCoin && openCoin.symbol === r.symbol;
+    html += `<tr class="data-row${isOpen?' open':''}" data-coin="${r.symbol}">
+      <td class="l coin"><span class="caret">▶</span>${r.symbol}${conflict}</td>
+      <td class="hide-m acc">${r.account.toFixed(1)}%</td>
+      <td class="hide-m pos">${r.position.toFixed(1)}%</td>
+      <td class="${divCls}">${divSign}${r.divergence.toFixed(1)}</td>
+      <td class="hide-m ${f.c}">${f.t}</td>
+      <td class="lvl ${r.level}">${r.level}</td>
+      <td class="l hide-m"><span class="tag ${tagCls}">${r.direction}</span></td>
+    </tr>`;
+    if (isOpen) {
+      html += `<tr class="chart-row" data-chart="${r.symbol}"><td colspan="7">
+        <div class="chart-box loading" id="chartBox"><span class="spin">⦿</span> Grafik yukleniyor...</div>
+      </td></tr>`;
+    }
+  }
+  tbody.innerHTML = html;
+
+  document.querySelectorAll('tr.data-row').forEach(tr => {
+    tr.addEventListener('click', () => toggleCoin(tr.dataset.coin));
+  });
+  if (openCoin && openCoin._lastSeries) drawChart(openCoin._lastSeries);
+}
+
+function updateHeaderArrows() {
+  document.querySelectorAll('#headrow th').forEach(th => {
+    const arr = th.querySelector('.arr');
+    if (!arr) return;
+    if (th.dataset.sort === sortKey) arr.innerHTML = sortDir === 'asc' ? '▲' : '▼';
+    else arr.innerHTML = '';
+  });
+}
+
+async function toggleCoin(sym) {
+  if (openCoin && openCoin.symbol === sym) { openCoin = null; renderTable(); return; }
+  openCoin = { symbol: sym, _lastSeries: null };
+  renderTable();
+  try {
+    const r = await fetch(`/api/series?symbol=${sym}&period=${currentPeriod}`);
+    const data = await r.json();
+    if (!openCoin || openCoin.symbol !== sym) return;
+    if (data.ok) { openCoin._lastSeries = data; drawChart(data); }
+    else {
+      const box = document.getElementById('chartBox');
+      if (box) { box.classList.remove('loading'); box.innerHTML = `<div style="color:var(--red);padding:20px;text-align:center">Grafik verisi alinamadi: ${data.error||''}</div>`; }
+    }
+  } catch (e) {
+    const box = document.getElementById('chartBox');
+    if (box) box.innerHTML = `<div style="color:var(--red);padding:20px;text-align:center">Hata: ${e.message}</div>`;
+  }
+}
+
+function cssVar(n){ return getComputedStyle(document.body).getPropertyValue(n).trim(); }
+
+function drawChart(data) {
+  const box = document.getElementById('chartBox');
+  if (!box) return;
+  box.classList.remove('loading');
+  const green = cssVar('--green'), amber = cssVar('--amber'), dim = cssVar('--text-dim'), grid = cssVar('--border');
+  box.innerHTML = `<div class="chart-canvas-wrap"><canvas id="lsChart"></canvas></div>
+    <div class="chart-legend">
+      <span><span class="lg-line" style="background:${dim}"></span>HESAP (kalabalik)</span>
+      <span><span class="lg-line" style="background:${amber}"></span>POZISYON (para)</span>
+    </div>`;
+  const labels = data.account.map(p => {
+    const d = new Date(p.t + 3*3600*1000);
+    return `${z(d.getUTCDate())}.${z(d.getUTCMonth()+1)} ${z(d.getUTCHours())}:${z(d.getUTCMinutes())}`;
+  });
+  if (chartInstance) { chartInstance.destroy(); chartInstance = null; }
+  const ctx = document.getElementById('lsChart').getContext('2d');
+  chartInstance = new Chart(ctx, {
+    type: 'line',
+    data: { labels, datasets: [
+      { label:'Hesap', data:data.account.map(p=>p.v), borderColor:dim, backgroundColor:'transparent', borderWidth:1.5, pointRadius:0, tension:0.25 },
+      { label:'Pozisyon', data:data.position.map(p=>p.v), borderColor:amber, backgroundColor:'transparent', borderWidth:2, pointRadius:0, tension:0.25 }
+    ]},
+    options: {
+      responsive:true, maintainAspectRatio:false, interaction:{mode:'index',intersect:false},
+      plugins:{ legend:{display:false}, tooltip:{ backgroundColor:cssVar('--bg-2'), titleColor:cssVar('--text'),
+        bodyColor:cssVar('--text'), borderColor:cssVar('--border-strong'), borderWidth:1, padding:8,
+        callbacks:{ label:(c)=>`${c.dataset.label}: ${c.parsed.y}%` } } },
+      scales:{ x:{ grid:{color:grid}, ticks:{color:dim,maxRotation:0,autoSkip:true,maxTicksLimit:6,font:{size:9}} },
+        y:{ grid:{color:grid}, ticks:{color:dim,font:{size:9},callback:(v)=>v+'%'} } }
+    }
+  });
+}
+
+function render(data) {
+  const status = document.getElementById('status');
   if (data.scanning) {
     status.innerHTML = `<span class="scanning"><span class="spin">⦿</span> Taraniyor... ${data.scanned||0}/${data.total||'?'} coin</span>`;
   } else if (data.error) {
     status.innerHTML = `<span class="err">Hata: ${data.error}</span> &middot; son tarama: ${fmtAge(data.ts)}`;
   } else {
-    status.innerHTML = `${data.results.length} ayrisan coin &middot; son tarama: ${fmtAge(data.ts)} &middot; periyot: ${currentPeriod}`;
+    const cf = allResults.filter(r=>r.fundingConflict).length;
+    status.innerHTML = `${data.results.length} ayrisan coin &middot; ${cf} funding celiskisi &middot; son tarama: ${fmtAge(data.ts)}`;
   }
-
-  const rows = data.results || [];
-  if (rows.length === 0) {
-    tbody.innerHTML = `<tr><td colspan="6" class="empty">${data.scanning ? 'Tarama suruyor, sonuclar birikiyor...' : 'Ayrisma yasayan coin bulunamadi (>=5)'}</td></tr>`;
-    return;
-  }
-
-  let html = '';
-  let lastLevel = null;
-  for (const r of rows) {
-    if (r.level !== lastLevel) {
-      const lblmap = {GUCLU:'GUCLU AYRISMA (15+)', ORTA:'ORTA AYRISMA (10-15)', HAFIF:'HAFIF AYRISMA (5-10)'};
-      html += `<tr class="section-row"><td colspan="6">${lblmap[r.level]||r.level}</td></tr>`;
-      lastLevel = r.level;
-    }
-    const f = fmtFunding(r.funding);
-    const divCls = r.divergence > 0 ? 'div-pos' : 'div-neg';
-    const divSign = r.divergence > 0 ? '+' : '';
-    const tagCls = r.divergence > 0 ? 'whale-long' : 'whale-short';
-    const conflict = r.fundingConflict ? '<span class="conflict-badge">FUNDING CELISKISI</span>' : '';
-    html += `<tr>
-      <td class="l coin">${r.symbol}</td>
-      <td class="hide-m acc">${r.account.toFixed(1)}%</td>
-      <td class="hide-m pos">${r.position.toFixed(1)}%</td>
-      <td class="${divCls}">${divSign}${r.divergence.toFixed(1)}</td>
-      <td class="hide-m ${f.c}">${f.t}</td>
-      <td class="l"><span class="tag ${tagCls}">${r.direction}</span>${conflict}</td>
-    </tr>`;
-  }
-  tbody.innerHTML = html;
+  allResults = data.results || [];
+  renderTable();
 }
 
 async function load(forceRun) {
@@ -441,7 +587,6 @@ async function load(forceRun) {
     const r = await fetch(url);
     const data = await r.json();
     render(data);
-    // Tarama suruyorsa veya cache bossa, kisa araliklarla yokla
     if (data.scanning || (!data.ts && !data.error)) {
       clearTimeout(pollTimer);
       pollTimer = setTimeout(() => load(false), 3000);
@@ -451,22 +596,46 @@ async function load(forceRun) {
   }
 }
 
+// Kolon siralama
+document.querySelectorAll('#headrow th[data-sort]').forEach(th => {
+  th.addEventListener('click', () => {
+    const k = th.dataset.sort;
+    if (sortKey === k) sortDir = sortDir === 'asc' ? 'desc' : 'asc';
+    else { sortKey = k; sortDir = (k === 'symbol') ? 'asc' : 'desc'; }
+    updateHeaderArrows(); renderTable();
+  });
+});
+
+// Periyot sekmeleri
 document.querySelectorAll('#tabs button').forEach(b => {
   b.addEventListener('click', () => {
     document.querySelectorAll('#tabs button').forEach(x => x.classList.remove('active'));
     b.classList.add('active');
     currentPeriod = b.dataset.period;
-    document.getElementById('tbody').innerHTML = '<tr><td colspan="6" class="empty">Yukleniyor...</td></tr>';
+    openCoin = null;
+    document.getElementById('tbody').innerHTML = '<tr><td colspan="7" class="empty">Yukleniyor...</td></tr>';
     load(false);
   });
 });
 
+// Arama
+document.getElementById('search').addEventListener('input', (e) => {
+  searchTerm = e.target.value.trim().toLowerCase();
+  renderTable();
+});
+
+// Celiski filtre
+document.getElementById('conflictBtn').addEventListener('click', () => {
+  conflictOnly = !conflictOnly;
+  document.getElementById('conflictBtn').classList.toggle('active', conflictOnly);
+  renderTable();
+});
+
 document.getElementById('refreshBtn').addEventListener('click', () => load(true));
 
-// Ilk yukleme: cache bossa otomatik tarama tetikle
+updateHeaderArrows();
 load(false);
-// Dashboard acikken her 60sn cache'i tazele (cron arada doldurmus olabilir)
-setInterval(() => { if (!document.hidden) load(false); }, 60000);
+setInterval(() => { if (!document.hidden && !openCoin) load(false); }, 60000);
 </script>
 </body>
 </html>
@@ -542,6 +711,13 @@ class ScrHandler(http.server.BaseHTTPRequestHandler):
                 time.sleep(0.3)
             self._json(200, _scan_payload(period)); return
 
+        if path == "/api/series":
+            sym = (q.get("symbol", [""])[0] or "").strip()
+            if not sym:
+                self._json(400, {"ok": False, "error": "symbol gerekli"}); return
+            res = fetch_series(sym, period)
+            self._json(200, res); return
+
         self._json(404, {"ok": False, "error": "not found"})
 
 
@@ -551,7 +727,7 @@ class ThreadedServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
 
 
 def main():
-    print(f"L/S Divergence Screener v1 listening on {HOST}:{PORT}", flush=True)
+    print(f"L/S Divergence Screener v2 listening on {HOST}:{PORT}", flush=True)
     try:
         with ThreadedServer((HOST, PORT), ScrHandler) as srv:
             srv.serve_forever()
