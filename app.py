@@ -1,17 +1,28 @@
 """
-L/S DIVERGENCE SCREENER (v2)
+L/S DIVERGENCE SCREENER (v3)
 =============================
 Binance futures'taki TUM USDT coinleri tarar; account(kalabalik) vs
 position(para) ayrismasi yasayanlari kademeli olarak listeler.
 
-- Kapsam: tum USDT futures (~400), exchangeInfo'dan otomatik
+- Kapsam: tum USDT futures (~400), exchangeInfo'dan otomatik (6 saat cache)
 - Periyot: 15m + 1h (ikisi de taranir, ayri cache)
 - Cron: 30dk'da bir /api/run-scan tetikler
 - weight=0 endpoint'ler (account + position L/S), 1000/5dk limit
+- funding: premiumIndex TEK toplu cagri (symbol'suz, weight 10) - 400 ayri cagri YOK
 - Filtre: |ayrisma| >= 5 (UYUMLU gizli)
 - Ban tracker + retry (v4.1 altyapisi)
 
-Calistirma: python3 app.py
+v3 BAN DUZELTMELERI:
+- premiumIndex tek toplu cagri (weight 10) - eski ban'in sebebi olan 400 cagri kaldirildi
+- BATCH 15->5, gruplar arasi throttle 1.5s, batch ICI ban kontrolu (http_get short-circuit)
+- /api/scan OTOMATIK tarama tetiklemez (sadece /api/run-scan cron/elle)
+- /api/series ban kontrolune bagli
+- exchangeInfo 6 saat cache (+ bayat fallback)
+
+v3 YENI: DERINLESEN AYRISMA (sadece 1h, bellekte gecmis) - ardisik taramada
+ayni yon + |ayrisma| >= 3 buyume. Ayri filtre + rozet.
+
+Calistirma: python3 scr_app.py
 """
 
 import http.server
@@ -84,30 +95,71 @@ _scan_state = {
     "1h":  {"ts": 0, "results": [], "scanning": False, "scanned": 0, "total": 0, "error": None},
 }
 
+# ===== exchangeInfo cache (6 saat) =====
+_symbols_cache = {"ts": 0.0, "syms": []}
+_EXCHANGE_TTL = 6 * 3600
+
+# ===== Derinlesen ayrisma gecmisi (SADECE 1h, bellekte) =====
+# symbol -> son ayrisma degeri. Servis restart'inda silinir (ilk 1-2 tarama bos).
+_div_history = {}
+
 
 def get_usdt_symbols():
-    """Tum aktif USDT perpetual futures sembolleri (exchangeInfo)."""
-    data = http_get("https://fapi.binance.com/fapi/v1/exchangeInfo", timeout=15)
+    """Tum aktif USDT perpetual futures sembolleri (exchangeInfo, 6 saat cache)."""
+    now = time.time()
+    if _symbols_cache["syms"] and (now - _symbols_cache["ts"]) < _EXCHANGE_TTL:
+        return _symbols_cache["syms"]
+    try:
+        data = http_get("https://fapi.binance.com/fapi/v1/exchangeInfo", timeout=15)
+    except Exception:
+        # bayat fallback: eski liste varsa onu kullan (ban/ag hatasi taramayi durdurmasin)
+        if _symbols_cache["syms"]:
+            return _symbols_cache["syms"]
+        raise
     syms = []
     for s in data.get("symbols", []):
         if (s.get("quoteAsset") == "USDT"
                 and s.get("contractType") == "PERPETUAL"
                 and s.get("status") == "TRADING"):
             syms.append(s["symbol"])
+    if syms:
+        _symbols_cache["syms"] = syms
+        _symbols_cache["ts"] = now
     return syms
 
 
-def _fetch_pair(sym, period):
-    """Bir coin icin account + position + funding. Donus dict veya None."""
-    acc = pos = funding = None
-    # Account ratio (kalabalik)
+def get_all_funding():
+    """TUM sembollerin funding'i TEK toplu cagri (premiumIndex symbol'suz, weight 10).
+    Donus: {SYMBOL: funding_yuzde}. Hata/ban'da bos dict (funding None gosterilir)."""
+    out = {}
+    try:
+        data = http_get("https://fapi.binance.com/fapi/v1/premiumIndex", timeout=15)
+    except Exception:
+        return out
+    if isinstance(data, list):
+        for d in data:
+            sym = d.get("symbol")
+            fr = d.get("lastFundingRate")
+            if sym and fr not in (None, ""):
+                try:
+                    out[sym] = float(fr) * 100
+                except Exception:
+                    pass
+    return out
+
+
+def _fetch_pair(sym, period, funding_map):
+    """Bir coin icin account + position (ikisi de weight=0). Funding toplu map'ten.
+    Donus dict veya None."""
+    acc = pos = None
+    # Account ratio (kalabalik) - weight 0
     try:
         j = http_get(f"https://fapi.binance.com/futures/data/globalLongShortAccountRatio?symbol={sym}&period={period}&limit=1")
         if isinstance(j, list) and j:
             acc = float(j[-1]["longAccount"]) * 100
     except Exception:
         pass
-    # Position ratio (para - top trader)
+    # Position ratio (para - top trader) - weight 0
     try:
         j = http_get(f"https://fapi.binance.com/futures/data/topLongShortPositionRatio?symbol={sym}&period={period}&limit=1")
         if isinstance(j, list) and j:
@@ -116,14 +168,8 @@ def _fetch_pair(sym, period):
         pass
     if acc is None or pos is None:
         return None
-    # Funding (premiumIndex - tek cagri, weight dusuk)
-    try:
-        pj = http_get(f"https://fapi.binance.com/fapi/v1/premiumIndex?symbol={sym}")
-        fr = pj.get("lastFundingRate")
-        if fr not in (None, ""):
-            funding = float(fr) * 100
-    except Exception:
-        pass
+    # Funding: per-coin cagri YOK; toplu premiumIndex map'inden (zaten yuzde)
+    funding = funding_map.get(sym)
 
     diff = pos - acc  # pozitif = para daha long = whale long / retail short
     return {
@@ -138,6 +184,8 @@ def _fetch_pair(sym, period):
 def fetch_series(sym, period, limit=48):
     """Bir coin icin account + position zaman serisi (grafik icin).
     Donus: {ok, account:[{t,v}], position:[{t,v}]} veya {ok:False}."""
+    if _binance_banned():
+        return {"ok": False, "error": "Binance gecici banli, grafik alinamadi"}
     symbol = sym.upper()
     if not symbol.endswith("USDT"):
         symbol += "USDT"
@@ -188,6 +236,18 @@ def _funding_conflict(diff, funding):
     return False
 
 
+def _is_deepening(prev_div, cur_div, threshold=3.0):
+    """Derinlesen ayrisma: ardisik taramada AYNI YON + magnitude >= threshold buyume.
+    -30 -> -35 = VAR (5 derinlesti). -30 -> -25 = YOK (daraldi). +11 -> -5 = YOK (ters donus).
+    prev_div None ise (ilk kez goruluyor) = YOK."""
+    if prev_div is None:
+        return False
+    # ters donus: isaret degisti -> derinlesme degil
+    if (prev_div > 0) != (cur_div > 0):
+        return False
+    return (abs(cur_div) - abs(prev_div)) >= threshold
+
+
 def run_scan(period):
     """Tum coinleri tara, ayrisanlari (>=5) doldur. Thread-safe state gunceller."""
     st = _scan_state[period]
@@ -201,32 +261,60 @@ def run_scan(period):
     try:
         syms = get_usdt_symbols()
         st["total"] = len(syms)
+
+        # FUNDING: tek toplu cagri (premiumIndex symbol'suz, weight 10) - 400 ayri cagri YOK
+        funding_map = get_all_funding()
+        if _binance_banned():
+            st["error"] = "Binance banli (funding cagrisi), tarama iptal"
+            return {"ok": False, "error": st["error"]}
+
         results = []
-        # Gruplar halinde + hafif throttle (weight=0 ama yine de nazik)
-        BATCH = 15
+        # Gruplar halinde + throttle. BATCH 5 (v3). account/position weight=0 ama nazik ol.
+        BATCH = 5
         for i in range(0, len(syms), BATCH):
+            # Batch ICI ban kontrolu: ban gelirse aninda dur (http_get de short-circuit eder)
             if _binance_banned():
                 st["error"] = "Binance banli, tarama yarida kesildi"
                 break
             batch = syms[i:i+BATCH]
             with ThreadPoolExecutor(max_workers=BATCH) as ex:
-                futs = {ex.submit(_fetch_pair, s, period): s for s in batch}
+                futs = {ex.submit(_fetch_pair, s, period, funding_map): s for s in batch}
                 for f in as_completed(futs):
                     r = f.result()
                     if r and abs(r["divergence"]) >= 5:
                         results.append(r)
             st["scanned"] = min(i + BATCH, len(syms))
-            time.sleep(0.4)  # gruplar arasi nefes
+            time.sleep(1.5)  # gruplar arasi throttle (v3: 0.4 -> 1.5)
         # Ayrisma buyuklugune gore sirala (mutlak deger, buyukten kucuge)
         results.sort(key=lambda r: abs(r["divergence"]), reverse=True)
+
+        # Derinlesen ayrisma sadece 1h (bellekteki onceki tarama ile kiyas)
+        if period == "1h":
+            with _scan_lock:
+                prev_hist = dict(_div_history)
+        else:
+            prev_hist = {}
+
         for r in results:
             lvl, direction = _label(r["divergence"])
             r["level"] = lvl
             r["direction"] = direction
             r["fundingConflict"] = _funding_conflict(r["divergence"], r["funding"])
+            if period == "1h":
+                prev = prev_hist.get(r["symbol"])
+                r["deepening"] = _is_deepening(prev, r["divergence"])
+                r["deepenDelta"] = round(abs(r["divergence"]) - abs(prev), 1) if r["deepening"] else None
+            else:
+                r["deepening"] = False
+                r["deepenDelta"] = None
+
         with _scan_lock:
             st["results"] = results
             st["ts"] = time.time()
+            # gecmisi guncelle (1h): bu taramadaki ayrisma degerlerini sakla
+            if period == "1h":
+                for r in results:
+                    _div_history[r["symbol"]] = r["divergence"]
         return {"ok": True, "count": len(results)}
     except Exception as e:
         st["error"] = str(e)
@@ -317,6 +405,10 @@ tr.open .coin .caret { transform:rotate(90deg); color:var(--green); }
 .tag.whale-short { color:var(--red); border-color:var(--red); }
 .conflict-badge { display:inline-block; font-size:9px; padding:2px 6px; margin-left:6px;
 background:var(--accent); color:var(--bg); font-weight:700; letter-spacing:0.03em; }
+.deepen-badge { display:inline-block; font-size:9px; padding:2px 6px; margin-left:5px;
+background:var(--amber); color:var(--bg); font-weight:700; letter-spacing:0.03em; }
+.filter-btn:disabled { opacity:0.32; cursor:not-allowed; }
+.filter-btn:disabled:hover { background:transparent; border-color:var(--border-strong); color:var(--text-dim); }
 .chart-row td { padding:0; border-bottom:1px solid var(--border-strong); background:var(--bg); }
 .chart-box { padding:16px 10px; }
 .chart-box.loading { text-align:center; color:var(--text-faint); padding:30px; font-size:11px; }
@@ -361,6 +453,7 @@ thead th { padding:7px 5px; font-size:9px; }
 </div>
 <input type="text" class="search" id="search" placeholder="Coin ara (orn. BTC)...">
 <button class="filter-btn" id="conflictBtn" title="Sadece funding celiskisi">&#9889; CELISKI</button>
+<button class="filter-btn" id="deepenBtn" title="Derinlesen ayrisma (sadece 1H)">&#8675; DERINLESEN</button>
 <button class="refresh-btn" id="refreshBtn">&#8635; YENILE</button>
 </div>
 
@@ -387,6 +480,7 @@ thead th { padding:7px 5px; font-size:9px; }
 <b>NE ISE YARAR?</b> Tum USDT futures coinlerinde <b>account (kalabalik)</b> vs <b>position (para/top trader)</b> ayrismasini tarar.<br><br>
 &bull; <b>AYRISMA = position - account.</b> Pozitif = para kalabaliktan daha long (whale long).<br>
 &bull; <b>&#9889; CELISKI</b> butonu: para yonu funding'le ters olanlari suzer (en dikkat cekici sinyal).<br>
+&bull; <b>&#8675; DERINLESEN</b> (sadece 1H): ardisik taramada ayni yon + en az 3 buyuyen ayrismalari suzer. Sarı rozet ayrisma derinlestigini gosterir.<br>
 &bull; Kolon basliklarina tiklayarak sirala. Coine tiklayarak grafigini ac.<br>
 &bull; |ayrisma| >= 5 olanlar; 30dk'da bir taranir. Finansal tavsiye degildir.
 </div>
@@ -399,6 +493,7 @@ let sortKey = 'absdiv';
 let sortDir = 'desc';
 let searchTerm = '';
 let conflictOnly = false;
+let deepenOnly = false;
 let openCoin = null;
 let chartInstance = null;
 
@@ -462,6 +557,7 @@ function sortRows(rows) {
 function visibleRows() {
   let rows = allResults;
   if (conflictOnly) rows = rows.filter(r => r.fundingConflict);
+  if (deepenOnly) rows = rows.filter(r => r.deepening);
   if (searchTerm) rows = rows.filter(r => r.symbol.toLowerCase().includes(searchTerm));
   return sortRows(rows);
 }
@@ -479,10 +575,11 @@ function renderTable() {
     const divCls = r.divergence > 0 ? 'div-pos' : 'div-neg';
     const divSign = r.divergence > 0 ? '+' : '';
     const tagCls = r.divergence > 0 ? 'whale-long' : 'whale-short';
-    const conflict = r.fundingConflict ? '<span class="conflict-badge">⚡</span>' : '';
+    const conflict = r.fundingConflict ? '<span class="conflict-badge" title="Funding celiskisi">⚡</span>' : '';
+    const deepen = r.deepening ? `<span class="deepen-badge" title="Derinlesen ayrisma">⇣${r.deepenDelta!=null?r.deepenDelta:''}</span>` : '';
     const isOpen = openCoin && openCoin.symbol === r.symbol;
     html += `<tr class="data-row${isOpen?' open':''}" data-coin="${r.symbol}">
-      <td class="l coin"><span class="caret">▶</span>${r.symbol}${conflict}</td>
+      <td class="l coin"><span class="caret">▶</span>${r.symbol}${conflict}${deepen}</td>
       <td class="hide-m acc">${r.account.toFixed(1)}%</td>
       <td class="hide-m pos">${r.position.toFixed(1)}%</td>
       <td class="${divCls}">${divSign}${r.divergence.toFixed(1)}</td>
@@ -569,15 +666,20 @@ function drawChart(data) {
 
 function render(data) {
   const status = document.getElementById('status');
+  allResults = data.results || [];
   if (data.scanning) {
     status.innerHTML = `<span class="scanning"><span class="spin">⦿</span> Taraniyor... ${data.scanned||0}/${data.total||'?'} coin</span>`;
   } else if (data.error) {
     status.innerHTML = `<span class="err">Hata: ${data.error}</span> &middot; son tarama: ${fmtAge(data.ts)}`;
+  } else if (!data.ts) {
+    status.innerHTML = `Henuz tarama yok &middot; <b style="color:var(--green)">YENILE</b>'ye bas veya 30dk cron'u bekle`;
   } else {
     const cf = allResults.filter(r=>r.fundingConflict).length;
-    status.innerHTML = `${data.results.length} ayrisan coin &middot; ${cf} funding celiskisi &middot; son tarama: ${fmtAge(data.ts)}`;
+    const dp = allResults.filter(r=>r.deepening).length;
+    let extra = `${cf} funding celiskisi`;
+    if (currentPeriod === '1h') extra += ` &middot; ${dp} derinlesen`;
+    status.innerHTML = `${allResults.length} ayrisan coin &middot; ${extra} &middot; son tarama: ${fmtAge(data.ts)}`;
   }
-  allResults = data.results || [];
   renderTable();
 }
 
@@ -587,7 +689,8 @@ async function load(forceRun) {
     const r = await fetch(url);
     const data = await r.json();
     render(data);
-    if (data.scanning || (!data.ts && !data.error)) {
+    // v3: sadece tarama suruyorken poll. Bos cache'te (ts=0, scanning=false) sonsuz poll YOK.
+    if (data.scanning) {
       clearTimeout(pollTimer);
       pollTimer = setTimeout(() => load(false), 3000);
     }
@@ -613,6 +716,7 @@ document.querySelectorAll('#tabs button').forEach(b => {
     b.classList.add('active');
     currentPeriod = b.dataset.period;
     openCoin = null;
+    updateDeepenBtn();
     document.getElementById('tbody').innerHTML = '<tr><td colspan="7" class="empty">Yukleniyor...</td></tr>';
     load(false);
   });
@@ -631,9 +735,28 @@ document.getElementById('conflictBtn').addEventListener('click', () => {
   renderTable();
 });
 
+// Derinlesme filtre (sadece 1H)
+function updateDeepenBtn() {
+  const btn = document.getElementById('deepenBtn');
+  if (currentPeriod !== '1h') {
+    deepenOnly = false;
+    btn.classList.remove('active');
+    btn.disabled = true;
+  } else {
+    btn.disabled = false;
+  }
+}
+document.getElementById('deepenBtn').addEventListener('click', () => {
+  if (currentPeriod !== '1h') return;
+  deepenOnly = !deepenOnly;
+  document.getElementById('deepenBtn').classList.toggle('active', deepenOnly);
+  renderTable();
+});
+
 document.getElementById('refreshBtn').addEventListener('click', () => load(true));
 
 updateHeaderArrows();
+updateDeepenBtn();
 load(false);
 setInterval(() => { if (!document.hidden && !openCoin) load(false); }, 60000);
 </script>
@@ -696,11 +819,8 @@ class ScrHandler(http.server.BaseHTTPRequestHandler):
             self._json(200, {"ok": True}); return
 
         if path == "/api/scan":
-            # Cache'ten servis. Bossa ve taranmiyor ise arka planda tarama baslat.
-            st = _scan_state[period]
-            if st["ts"] == 0 and not st["scanning"]:
-                threading.Thread(target=run_scan, args=(period,), daemon=True).start()
-                time.sleep(0.3)
+            # v3: SADECE cache servis. Otomatik tarama YOK (sayfa acmak ban tetiklemesin).
+            # Tarama yalnizca /api/run-scan (cron) veya elle YENILE ile baslar.
             self._json(200, _scan_payload(period)); return
 
         if path == "/api/run-scan":
@@ -727,7 +847,7 @@ class ThreadedServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
 
 
 def main():
-    print(f"L/S Divergence Screener v2 listening on {HOST}:{PORT}", flush=True)
+    print(f"L/S Divergence Screener v3 listening on {HOST}:{PORT}", flush=True)
     try:
         with ThreadedServer((HOST, PORT), ScrHandler) as srv:
             srv.serve_forever()
