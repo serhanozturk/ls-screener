@@ -1,26 +1,27 @@
 """
-L/S DIVERGENCE SCREENER (v3)
+L/S DIVERGENCE SCREENER (v4)
 =============================
 Binance futures'taki TUM USDT coinleri tarar; account(kalabalik) vs
-position(para) ayrismasi yasayanlari kademeli olarak listeler.
+position(para) ayrismasi + ERKEN SINYAL (patlama/dusus adayi) tespiti.
 
 - Kapsam: tum USDT futures (~400), exchangeInfo'dan otomatik (6 saat cache)
 - Periyot: 15m + 1h (ikisi de taranir, ayri cache)
 - Cron: 30dk'da bir /api/run-scan tetikler
-- weight=0 endpoint'ler (account + position L/S), 1000/5dk limit
-- funding: premiumIndex TEK toplu cagri (symbol'suz, weight 10) - 400 ayri cagri YOK
-- Filtre: |ayrisma| >= 5 (UYUMLU gizli)
-- Ban tracker + retry (v4.1 altyapisi)
+- weight=0 endpoint'ler (account + position + OI hist), funding tek toplu cagri
+- Filtre: |ayrisma| >= 5 VEYA patlama/dusus skoru >= 2
 
-v3 BAN DUZELTMELERI:
-- premiumIndex tek toplu cagri (weight 10) - eski ban'in sebebi olan 400 cagri kaldirildi
-- BATCH 15->5, gruplar arasi throttle 1.5s, batch ICI ban kontrolu (http_get short-circuit)
-- /api/scan OTOMATIK tarama tetiklemez (sadece /api/run-scan cron/elle)
+v3 BAN DUZELTMELERI (korundu):
+- premiumIndex tek toplu cagri (weight 10) - 400 cagri YOK
+- BATCH 5, throttle 1.5s, batch ICI ban kontrolu
+- /api/scan otomatik tarama tetiklemez
 - /api/series ban kontrolune bagli
-- exchangeInfo 6 saat cache (+ bayat fallback)
+- exchangeInfo 6 saat cache
 
-v3 YENI: DERINLESEN AYRISMA (sadece 1h, bellekte gecmis) - ardisik taramada
-ayni yon + |ayrisma| >= 3 buyume. Ayri filtre + rozet.
+v4 YENI: ERKEN SINYAL (patlama/dusus adayi)
+- OI degisimi: openInterestHist (weight 0), son 2 mum, taranan periyotla ayni
+- PATLAMA skoru (0-3): whale long + OI>=+%2 + funding<=0
+- DUSUS skoru (0-3): whale short + OI<=-%2 + funding>=%0.05
+- 3/3 GUCLU, 2/3 ADAY. Ayri filtre butonlari + rozet + OI% kolonu.
 
 Calistirma: python3 scr_app.py
 """
@@ -40,6 +41,11 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 PORT = int(os.environ.get("PORT", 8766))
 HOST = "0.0.0.0"
 USER_AGENT = "Mozilla/5.0 LSScreener/1.0"
+
+# ===== Esikler (v4 erken sinyal) =====
+OI_CHANGE_MIN = 2.0       # OI degisim esigi % (patlama: >=+2, dusus: <=-2)
+FUNDING_HIGH = 0.05       # dusus: funding bu degerin ustu = asiri long kaldirac
+SCORE_CANDIDATE = 2       # >=2 aday, 3 guclu
 
 # ===== Binance yerel ban takibi =====
 _ban_until = 0.0
@@ -100,7 +106,6 @@ _symbols_cache = {"ts": 0.0, "syms": []}
 _EXCHANGE_TTL = 6 * 3600
 
 # ===== Derinlesen ayrisma gecmisi (SADECE 1h, bellekte) =====
-# symbol -> son ayrisma degeri. Servis restart'inda silinir (ilk 1-2 tarama bos).
 _div_history = {}
 
 
@@ -112,7 +117,6 @@ def get_usdt_symbols():
     try:
         data = http_get("https://fapi.binance.com/fapi/v1/exchangeInfo", timeout=15)
     except Exception:
-        # bayat fallback: eski liste varsa onu kullan (ban/ag hatasi taramayi durdurmasin)
         if _symbols_cache["syms"]:
             return _symbols_cache["syms"]
         raise
@@ -129,8 +133,7 @@ def get_usdt_symbols():
 
 
 def get_all_funding():
-    """TUM sembollerin funding'i TEK toplu cagri (premiumIndex symbol'suz, weight 10).
-    Donus: {SYMBOL: funding_yuzde}. Hata/ban'da bos dict (funding None gosterilir)."""
+    """TUM sembollerin funding'i TEK toplu cagri (premiumIndex symbol'suz, weight 10)."""
     out = {}
     try:
         data = http_get("https://fapi.binance.com/fapi/v1/premiumIndex", timeout=15)
@@ -148,18 +151,53 @@ def get_all_funding():
     return out
 
 
+def _fetch_oi_change(sym, period):
+    """OI degisimi: openInterestHist (weight 0), son 2 mum. Donus % veya None.
+    Kontrat (sumOpenInterest) bazli - notional degil (fiyat cift saymaz)."""
+    try:
+        j = http_get(f"https://fapi.binance.com/futures/data/openInterestHist?symbol={sym}&period={period}&limit=2")
+        if isinstance(j, list) and len(j) >= 2:
+            prev = float(j[-2].get("sumOpenInterest") or 0)
+            now = float(j[-1].get("sumOpenInterest") or 0)
+            if prev > 0:
+                return round((now - prev) / prev * 100, 2)
+    except Exception:
+        pass
+    return None
+
+
+def _early_signal(diff, oi_chg, funding):
+    """Patlama/dusus skoru (0-3 her biri). Donus: (tip, skor) veya (None, 0).
+    PATLAMA: whale long + OI>=+2 + funding<=0
+    DUSUS:   whale short + OI<=-2 + funding>=0.05"""
+    # Patlama skoru
+    pump = 0
+    if diff > 0: pump += 1                                  # whale long
+    if oi_chg is not None and oi_chg >= OI_CHANGE_MIN: pump += 1   # para giriyor
+    if funding is not None and funding <= 0: pump += 1      # short yakiti
+    # Dusus skoru
+    dump = 0
+    if diff < 0: dump += 1                                  # whale short
+    if oi_chg is not None and oi_chg <= -OI_CHANGE_MIN: dump += 1  # ralli bitiyor
+    if funding is not None and funding >= FUNDING_HIGH: dump += 1  # asiri long kaldirac
+    # En yuksek skoru olan tip kazanir (esitlikte ikisini de gosterme - net olani al)
+    if pump >= SCORE_CANDIDATE and pump >= dump:
+        return ("PATLAMA", pump)
+    if dump >= SCORE_CANDIDATE and dump > pump:
+        return ("DUSUS", dump)
+    return (None, 0)
+
+
 def _fetch_pair(sym, period, funding_map):
-    """Bir coin icin account + position (ikisi de weight=0). Funding toplu map'ten.
-    Donus dict veya None."""
+    """Bir coin icin account + position (weight=0) + OI degisimi (weight=0).
+    Funding toplu map'ten. Donus dict veya None."""
     acc = pos = None
-    # Account ratio (kalabalik) - weight 0
     try:
         j = http_get(f"https://fapi.binance.com/futures/data/globalLongShortAccountRatio?symbol={sym}&period={period}&limit=1")
         if isinstance(j, list) and j:
             acc = float(j[-1]["longAccount"]) * 100
     except Exception:
         pass
-    # Position ratio (para - top trader) - weight 0
     try:
         j = http_get(f"https://fapi.binance.com/futures/data/topLongShortPositionRatio?symbol={sym}&period={period}&limit=1")
         if isinstance(j, list) and j:
@@ -168,22 +206,22 @@ def _fetch_pair(sym, period, funding_map):
         pass
     if acc is None or pos is None:
         return None
-    # Funding: per-coin cagri YOK; toplu premiumIndex map'inden (zaten yuzde)
     funding = funding_map.get(sym)
+    oi_chg = _fetch_oi_change(sym, period)  # weight 0
+    diff = pos - acc
 
-    diff = pos - acc  # pozitif = para daha long = whale long / retail short
     return {
         "symbol": sym.replace("USDT", ""),
         "account": round(acc, 2),
         "position": round(pos, 2),
         "divergence": round(diff, 2),
         "funding": round(funding, 4) if funding is not None else None,
+        "oiChange": oi_chg,
     }
 
 
 def fetch_series(sym, period, limit=48):
-    """Bir coin icin account + position zaman serisi (grafik icin).
-    Donus: {ok, account:[{t,v}], position:[{t,v}]} veya {ok:False}."""
+    """account + position zaman serisi (grafik)."""
     if _binance_banned():
         return {"ok": False, "error": "Binance gecici banli, grafik alinamadi"}
     symbol = sym.upper()
@@ -222,13 +260,8 @@ def _label(diff):
 
 
 def _funding_conflict(diff, funding):
-    """Funding ile ayrisma celiskisi (asil aranan sinyal):
-    - funding+ (longlar oduyor) ama whale SHORT -> para asagi bahse ragmen kalabalik long
-    - funding- (shortlar oduyor) ama whale LONG  -> para yukari bahse ragmen kalabalik short
-    Celiski = para (position) yonu ile funding yonu TERS."""
     if funding is None or abs(diff) < 5:
         return False
-    # whale long (diff>0) + funding negatif = celiski; whale short (diff<0) + funding pozitif = celiski
     if diff > 0 and funding < -0.005:
         return True
     if diff < 0 and funding > 0.005:
@@ -237,19 +270,15 @@ def _funding_conflict(diff, funding):
 
 
 def _is_deepening(prev_div, cur_div, threshold=3.0):
-    """Derinlesen ayrisma: ardisik taramada AYNI YON + magnitude >= threshold buyume.
-    -30 -> -35 = VAR (5 derinlesti). -30 -> -25 = YOK (daraldi). +11 -> -5 = YOK (ters donus).
-    prev_div None ise (ilk kez goruluyor) = YOK."""
     if prev_div is None:
         return False
-    # ters donus: isaret degisti -> derinlesme degil
     if (prev_div > 0) != (cur_div > 0):
         return False
     return (abs(cur_div) - abs(prev_div)) >= threshold
 
 
 def run_scan(period):
-    """Tum coinleri tara, ayrisanlari (>=5) doldur. Thread-safe state gunceller."""
+    """Tum coinleri tara. Listeye giren: |ayrisma|>=5 VEYA patlama/dusus skoru>=2."""
     st = _scan_state[period]
     with _scan_lock:
         if st["scanning"]:
@@ -262,17 +291,14 @@ def run_scan(period):
         syms = get_usdt_symbols()
         st["total"] = len(syms)
 
-        # FUNDING: tek toplu cagri (premiumIndex symbol'suz, weight 10) - 400 ayri cagri YOK
         funding_map = get_all_funding()
         if _binance_banned():
             st["error"] = "Binance banli (funding cagrisi), tarama iptal"
             return {"ok": False, "error": st["error"]}
 
         results = []
-        # Gruplar halinde + throttle. BATCH 5 (v3). account/position weight=0 ama nazik ol.
         BATCH = 5
         for i in range(0, len(syms), BATCH):
-            # Batch ICI ban kontrolu: ban gelirse aninda dur (http_get de short-circuit eder)
             if _binance_banned():
                 st["error"] = "Binance banli, tarama yarida kesildi"
                 break
@@ -281,14 +307,20 @@ def run_scan(period):
                 futs = {ex.submit(_fetch_pair, s, period, funding_map): s for s in batch}
                 for f in as_completed(futs):
                     r = f.result()
-                    if r and abs(r["divergence"]) >= 5:
+                    if not r:
+                        continue
+                    # Erken sinyal skoru
+                    sig_type, sig_score = _early_signal(r["divergence"], r["oiChange"], r["funding"])
+                    r["signalType"] = sig_type      # PATLAMA / DUSUS / None
+                    r["signalScore"] = sig_score    # 0-3
+                    # Listeye girme kriteri: ayrisma>=5 VEYA aday (skor>=2)
+                    if abs(r["divergence"]) >= 5 or sig_score >= SCORE_CANDIDATE:
                         results.append(r)
             st["scanned"] = min(i + BATCH, len(syms))
-            time.sleep(1.5)  # gruplar arasi throttle (v3: 0.4 -> 1.5)
-        # Ayrisma buyuklugune gore sirala (mutlak deger, buyukten kucuge)
+            time.sleep(1.5)
+
         results.sort(key=lambda r: abs(r["divergence"]), reverse=True)
 
-        # Derinlesen ayrisma sadece 1h (bellekteki onceki tarama ile kiyas)
         if period == "1h":
             with _scan_lock:
                 prev_hist = dict(_div_history)
@@ -311,7 +343,6 @@ def run_scan(period):
         with _scan_lock:
             st["results"] = results
             st["ts"] = time.time()
-            # gecmisi guncelle (1h): bu taramadaki ayrisma degerlerini sakla
             if period == "1h":
                 for r in results:
                     _div_history[r["symbol"]] = r["divergence"]
@@ -321,6 +352,7 @@ def run_scan(period):
         return {"ok": False, "error": str(e)}
     finally:
         st["scanning"] = False
+
 
 
 SCREENER_HTML = '''<!DOCTYPE html>
@@ -363,14 +395,18 @@ font-size:15px; width:34px; height:34px; cursor:pointer; border-radius:0; }
 .tabs button { background:transparent; border:1px solid var(--border); color:var(--text-dim);
 font-family:inherit; font-size:12px; padding:8px 18px; cursor:pointer; letter-spacing:0.08em; border-radius:0; }
 .tabs button.active { background:var(--green); color:var(--bg); border-color:var(--green); font-weight:700; }
-.search { flex:1; min-width:130px; background:var(--bg-2); border:1px solid var(--border); color:var(--text);
+.search { flex:1; min-width:120px; background:var(--bg-2); border:1px solid var(--border); color:var(--text);
 font-family:inherit; font-size:12px; padding:8px 12px; border-radius:0; }
 .search:focus { outline:none; border-color:var(--green); }
 .filter-btn { background:transparent; border:1px solid var(--border-strong); color:var(--text-dim);
-font-family:inherit; font-size:11px; padding:8px 14px; cursor:pointer; letter-spacing:0.05em; border-radius:0; white-space:nowrap; }
+font-family:inherit; font-size:11px; padding:8px 12px; cursor:pointer; letter-spacing:0.04em; border-radius:0; white-space:nowrap; }
 .filter-btn.active { background:var(--accent); color:var(--bg); border-color:var(--accent); font-weight:700; }
+.filter-btn.pump.active { background:var(--green); border-color:var(--green); }
+.filter-btn.dump.active { background:var(--red); border-color:var(--red); }
+.filter-btn:disabled { opacity:0.32; cursor:not-allowed; }
+.filter-btn:disabled:hover { background:transparent; border-color:var(--border-strong); color:var(--text-dim); }
 .refresh-btn { background:transparent; border:1px solid var(--border-strong); color:var(--text);
-font-family:inherit; font-size:11px; padding:8px 14px; cursor:pointer; letter-spacing:0.05em; border-radius:0; white-space:nowrap; }
+font-family:inherit; font-size:11px; padding:8px 12px; cursor:pointer; letter-spacing:0.04em; border-radius:0; white-space:nowrap; }
 .refresh-btn:hover { border-color:var(--green); color:var(--green); }
 .status { font-size:11px; color:var(--text-dim); margin-bottom:14px; min-height:16px; }
 .status .scanning { color:var(--amber); }
@@ -394,6 +430,8 @@ tr.open .coin .caret { transform:rotate(90deg); color:var(--green); }
 .pos { color:var(--amber); }
 .div-pos { color:var(--green); font-weight:700; }
 .div-neg { color:var(--red); font-weight:700; }
+.oi-pos { color:var(--green); }
+.oi-neg { color:var(--red); }
 .fund-pos { color:var(--green); }
 .fund-neg { color:var(--red); }
 .lvl { font-size:10px; letter-spacing:0.05em; }
@@ -407,8 +445,10 @@ tr.open .coin .caret { transform:rotate(90deg); color:var(--green); }
 background:var(--accent); color:var(--bg); font-weight:700; letter-spacing:0.03em; }
 .deepen-badge { display:inline-block; font-size:9px; padding:2px 6px; margin-left:5px;
 background:var(--amber); color:var(--bg); font-weight:700; letter-spacing:0.03em; }
-.filter-btn:disabled { opacity:0.32; cursor:not-allowed; }
-.filter-btn:disabled:hover { background:transparent; border-color:var(--border-strong); color:var(--text-dim); }
+.pump-badge { display:inline-block; font-size:9px; padding:2px 6px; margin-left:5px;
+background:var(--green); color:var(--bg); font-weight:700; letter-spacing:0.03em; }
+.dump-badge { display:inline-block; font-size:9px; padding:2px 6px; margin-left:5px;
+background:var(--red); color:var(--bg); font-weight:700; letter-spacing:0.03em; }
 .chart-row td { padding:0; border-bottom:1px solid var(--border-strong); background:var(--bg); }
 .chart-box { padding:16px 10px; }
 .chart-box.loading { text-align:center; color:var(--text-faint); padding:30px; font-size:11px; }
@@ -451,9 +491,11 @@ thead th { padding:7px 5px; font-size:9px; }
 <button data-period="15m">15M</button>
 <button data-period="1h" class="active">1H</button>
 </div>
-<input type="text" class="search" id="search" placeholder="Coin ara (orn. BTC)...">
-<button class="filter-btn" id="conflictBtn" title="Sadece funding celiskisi">&#9889; CELISKI</button>
-<button class="filter-btn" id="deepenBtn" title="Derinlesen ayrisma (sadece 1H)">&#8675; DERINLESEN</button>
+<input type="text" class="search" id="search" placeholder="Coin ara...">
+<button class="filter-btn pump" id="pumpBtn" title="Patlama adaylari">&#128640; PATLAMA</button>
+<button class="filter-btn dump" id="dumpBtn" title="Dusus adaylari">&#128201; DUSUS</button>
+<button class="filter-btn" id="conflictBtn" title="Funding celiskisi">&#9889; CELISKI</button>
+<button class="filter-btn" id="deepenBtn" title="Derinlesen ayrisma (1H)">&#8675; DERINLESEN</button>
 <button class="refresh-btn" id="refreshBtn">&#8635; YENILE</button>
 </div>
 
@@ -466,23 +508,24 @@ thead th { padding:7px 5px; font-size:9px; }
 <th class="hide-m" data-sort="account">HESAP<span class="arr"></span></th>
 <th class="hide-m" data-sort="position">POZISYON<span class="arr"></span></th>
 <th data-sort="absdiv">AYRISMA<span class="arr">&#9660;</span></th>
+<th class="hide-m" data-sort="oichange">OI%<span class="arr"></span></th>
 <th class="hide-m" data-sort="funding">FUNDING<span class="arr"></span></th>
-<th data-sort="level">SEVIYE<span class="arr"></span></th>
+<th data-sort="signal">SINYAL<span class="arr"></span></th>
 <th class="l hide-m">ETIKET</th>
 </tr>
 </thead>
 <tbody id="tbody">
-<tr><td colspan="7" class="empty">Yukleniyor...</td></tr>
+<tr><td colspan="8" class="empty">Yukleniyor...</td></tr>
 </tbody>
 </table>
 
 <div class="info">
-<b>NE ISE YARAR?</b> Tum USDT futures coinlerinde <b>account (kalabalik)</b> vs <b>position (para/top trader)</b> ayrismasini tarar.<br><br>
+<b>NE ISE YARAR?</b> Tum USDT futures coinlerinde ayrisma + erken sinyal (patlama/dusus) tarar.<br><br>
 &bull; <b>AYRISMA = position - account.</b> Pozitif = para kalabaliktan daha long (whale long).<br>
-&bull; <b>&#9889; CELISKI</b> butonu: para yonu funding'le ters olanlari suzer (en dikkat cekici sinyal).<br>
-&bull; <b>&#8675; DERINLESEN</b> (sadece 1H): ardisik taramada ayni yon + en az 3 buyuyen ayrismalari suzer. Sarı rozet ayrisma derinlestigini gosterir.<br>
-&bull; Kolon basliklarina tiklayarak sirala. Coine tiklayarak grafigini ac.<br>
-&bull; |ayrisma| >= 5 olanlar; 30dk'da bir taranir. Finansal tavsiye degildir.
+&bull; <b>&#128640; PATLAMA</b> (0-3 skor): whale long + OI artisi(&ge;+2%) + funding&le;0 (short yakiti). Yukari potansiyel.<br>
+&bull; <b>&#128201; DUSUS</b> (0-3 skor): whale short + OI dususu(&le;-2%) + funding&ge;0.05 (asiri long kaldirac). Tepe/sisme.<br>
+&bull; <b>&#9889; CELISKI</b>: para yonu funding'le ters. <b>&#8675; DERINLESEN</b> (1H): ayrisma ardisik buyuyor.<br>
+&bull; Listeye giren: |ayrisma|&ge;5 VEYA sinyal skoru&ge;2. Coine tikla = grafik. 30dk'da bir taranir. Finansal tavsiye degildir.
 </div>
 </div>
 <script>
@@ -494,6 +537,8 @@ let sortDir = 'desc';
 let searchTerm = '';
 let conflictOnly = false;
 let deepenOnly = false;
+let pumpOnly = false;
+let dumpOnly = false;
 let openCoin = null;
 let chartInstance = null;
 
@@ -511,7 +556,7 @@ setInterval(tick, 1000); tick();
 
 function applyTheme(light) {
   document.body.classList.toggle('light', light);
-  document.getElementById('themeBtn').innerHTML = light ? '☀' : '☽';
+  document.getElementById('themeBtn').innerHTML = light ? '\u2600' : '\u263D';
   document.querySelector('meta[name=theme-color]').setAttribute('content', light ? '#f4f6f5' : '#0a0e0d');
   try { localStorage.setItem('scr_theme', light ? 'light' : 'dark'); } catch {}
   if (chartInstance && openCoin) { drawChart(openCoin._lastSeries); }
@@ -529,9 +574,14 @@ function fmtAge(ts) {
   return Math.floor(sec/3600) + 'sa once';
 }
 function fmtFunding(f) {
-  if (f == null) return {t:'—', c:''};
+  if (f == null) return {t:'\u2014', c:''};
   const s = f >= 0 ? '+' : '';
   return {t: s + f.toFixed(4) + '%', c: f > 0 ? 'fund-pos' : (f < 0 ? 'fund-neg' : '')};
+}
+function fmtOi(o) {
+  if (o == null) return {t:'\u2014', c:''};
+  const s = o >= 0 ? '+' : '';
+  return {t: s + o.toFixed(2) + '%', c: o > 0 ? 'oi-pos' : (o < 0 ? 'oi-neg' : '')};
 }
 
 const LEVEL_ORDER = { GUCLU:3, ORTA:2, HAFIF:1 };
@@ -545,7 +595,9 @@ function sortRows(rows) {
       case 'account': va = a.account; vb = b.account; break;
       case 'position': va = a.position; vb = b.position; break;
       case 'absdiv': va = Math.abs(a.divergence); vb = Math.abs(b.divergence); break;
+      case 'oichange': va = a.oiChange==null?-999:a.oiChange; vb = b.oiChange==null?-999:b.oiChange; break;
       case 'funding': va = a.funding==null?-999:a.funding; vb = b.funding==null?-999:b.funding; break;
+      case 'signal': va = a.signalScore||0; vb = b.signalScore||0; break;
       case 'level': va = LEVEL_ORDER[a.level]||0; vb = LEVEL_ORDER[b.level]||0;
                     if (va===vb){ return (Math.abs(b.divergence)-Math.abs(a.divergence)); } break;
       default: va = Math.abs(a.divergence); vb = Math.abs(b.divergence);
@@ -556,6 +608,8 @@ function sortRows(rows) {
 
 function visibleRows() {
   let rows = allResults;
+  if (pumpOnly) rows = rows.filter(r => r.signalType === 'PATLAMA');
+  if (dumpOnly) rows = rows.filter(r => r.signalType === 'DUSUS');
   if (conflictOnly) rows = rows.filter(r => r.fundingConflict);
   if (deepenOnly) rows = rows.filter(r => r.deepening);
   if (searchTerm) rows = rows.filter(r => r.symbol.toLowerCase().includes(searchTerm));
@@ -566,35 +620,39 @@ function renderTable() {
   const tbody = document.getElementById('tbody');
   const rows = visibleRows();
   if (rows.length === 0) {
-    tbody.innerHTML = `<tr><td colspan="7" class="empty">${allResults.length ? 'Filtreye uyan coin yok' : 'Ayrisan coin bulunamadi'}</td></tr>`;
+    tbody.innerHTML = `<tr><td colspan="8" class="empty">${allResults.length ? 'Filtreye uyan coin yok' : 'Sonuc yok'}</td></tr>`;
     return;
   }
   let html = '';
   for (const r of rows) {
     const f = fmtFunding(r.funding);
+    const o = fmtOi(r.oiChange);
     const divCls = r.divergence > 0 ? 'div-pos' : 'div-neg';
     const divSign = r.divergence > 0 ? '+' : '';
     const tagCls = r.divergence > 0 ? 'whale-long' : 'whale-short';
-    const conflict = r.fundingConflict ? '<span class="conflict-badge" title="Funding celiskisi">⚡</span>' : '';
-    const deepen = r.deepening ? `<span class="deepen-badge" title="Derinlesen ayrisma">⇣${r.deepenDelta!=null?r.deepenDelta:''}</span>` : '';
+    const conflict = r.fundingConflict ? '<span class="conflict-badge" title="Funding celiskisi">\u26A1</span>' : '';
+    const deepen = r.deepening ? `<span class="deepen-badge" title="Derinlesen ayrisma">\u21E3${r.deepenDelta!=null?r.deepenDelta:''}</span>` : '';
+    let signal = '';
+    if (r.signalType === 'PATLAMA') signal = `<span class="pump-badge" title="Patlama adayi">🚀${r.signalScore}</span>`;
+    else if (r.signalType === 'DUSUS') signal = `<span class="dump-badge" title="Dusus adayi">📉${r.signalScore}</span>`;
     const isOpen = openCoin && openCoin.symbol === r.symbol;
     html += `<tr class="data-row${isOpen?' open':''}" data-coin="${r.symbol}">
-      <td class="l coin"><span class="caret">▶</span>${r.symbol}${conflict}${deepen}</td>
+      <td class="l coin"><span class="caret">\u25B6</span>${r.symbol}${conflict}${deepen}</td>
       <td class="hide-m acc">${r.account.toFixed(1)}%</td>
       <td class="hide-m pos">${r.position.toFixed(1)}%</td>
       <td class="${divCls}">${divSign}${r.divergence.toFixed(1)}</td>
+      <td class="hide-m ${o.c}">${o.t}</td>
       <td class="hide-m ${f.c}">${f.t}</td>
-      <td class="lvl ${r.level}">${r.level}</td>
+      <td>${signal||'<span style="color:var(--text-faint)">\u2014</span>'}</td>
       <td class="l hide-m"><span class="tag ${tagCls}">${r.direction}</span></td>
     </tr>`;
     if (isOpen) {
-      html += `<tr class="chart-row" data-chart="${r.symbol}"><td colspan="7">
-        <div class="chart-box loading" id="chartBox"><span class="spin">⦿</span> Grafik yukleniyor...</div>
+      html += `<tr class="chart-row" data-chart="${r.symbol}"><td colspan="8">
+        <div class="chart-box loading" id="chartBox"><span class="spin">\u29BF</span> Grafik yukleniyor...</div>
       </td></tr>`;
     }
   }
   tbody.innerHTML = html;
-
   document.querySelectorAll('tr.data-row').forEach(tr => {
     tr.addEventListener('click', () => toggleCoin(tr.dataset.coin));
   });
@@ -605,7 +663,7 @@ function updateHeaderArrows() {
   document.querySelectorAll('#headrow th').forEach(th => {
     const arr = th.querySelector('.arr');
     if (!arr) return;
-    if (th.dataset.sort === sortKey) arr.innerHTML = sortDir === 'asc' ? '▲' : '▼';
+    if (th.dataset.sort === sortKey) arr.innerHTML = sortDir === 'asc' ? '\u25B2' : '\u25BC';
     else arr.innerHTML = '';
   });
 }
@@ -621,7 +679,7 @@ async function toggleCoin(sym) {
     if (data.ok) { openCoin._lastSeries = data; drawChart(data); }
     else {
       const box = document.getElementById('chartBox');
-      if (box) { box.classList.remove('loading'); box.innerHTML = `<div style="color:var(--red);padding:20px;text-align:center">Grafik verisi alinamadi: ${data.error||''}</div>`; }
+      if (box) { box.classList.remove('loading'); box.innerHTML = `<div style="color:var(--red);padding:20px;text-align:center">Grafik alinamadi: ${data.error||''}</div>`; }
     }
   } catch (e) {
     const box = document.getElementById('chartBox');
@@ -635,7 +693,7 @@ function drawChart(data) {
   const box = document.getElementById('chartBox');
   if (!box) return;
   box.classList.remove('loading');
-  const green = cssVar('--green'), amber = cssVar('--amber'), dim = cssVar('--text-dim'), grid = cssVar('--border');
+  const amber = cssVar('--amber'), dim = cssVar('--text-dim'), grid = cssVar('--border');
   box.innerHTML = `<div class="chart-canvas-wrap"><canvas id="lsChart"></canvas></div>
     <div class="chart-legend">
       <span><span class="lg-line" style="background:${dim}"></span>HESAP (kalabalik)</span>
@@ -668,17 +726,21 @@ function render(data) {
   const status = document.getElementById('status');
   allResults = data.results || [];
   if (data.scanning) {
-    status.innerHTML = `<span class="scanning"><span class="spin">⦿</span> Taraniyor... ${data.scanned||0}/${data.total||'?'} coin</span>`;
+    status.innerHTML = `<span class="scanning"><span class="spin">\u29BF</span> Taraniyor... ${data.scanned||0}/${data.total||'?'} coin</span>`;
   } else if (data.error) {
     status.innerHTML = `<span class="err">Hata: ${data.error}</span> &middot; son tarama: ${fmtAge(data.ts)}`;
   } else if (!data.ts) {
     status.innerHTML = `Henuz tarama yok &middot; <b style="color:var(--green)">YENILE</b>'ye bas veya 30dk cron'u bekle`;
   } else {
+    const pump = allResults.filter(r=>r.signalType==='PATLAMA').length;
+    const dump = allResults.filter(r=>r.signalType==='DUSUS').length;
     const cf = allResults.filter(r=>r.fundingConflict).length;
-    const dp = allResults.filter(r=>r.deepening).length;
-    let extra = `${cf} funding celiskisi`;
-    if (currentPeriod === '1h') extra += ` &middot; ${dp} derinlesen`;
-    status.innerHTML = `${allResults.length} ayrisan coin &middot; ${extra} &middot; son tarama: ${fmtAge(data.ts)}`;
+    let extra = `🚀 ${pump} patlama &middot; 📉 ${dump} dusus &middot; \u26A1 ${cf} celiski`;
+    if (currentPeriod === '1h') {
+      const dp = allResults.filter(r=>r.deepening).length;
+      extra += ` &middot; \u21E3 ${dp} derinlesen`;
+    }
+    status.innerHTML = `${allResults.length} sonuc &middot; ${extra} &middot; ${fmtAge(data.ts)}`;
   }
   renderTable();
 }
@@ -689,7 +751,6 @@ async function load(forceRun) {
     const r = await fetch(url);
     const data = await r.json();
     render(data);
-    // v3: sadece tarama suruyorken poll. Bos cache'te (ts=0, scanning=false) sonsuz poll YOK.
     if (data.scanning) {
       clearTimeout(pollTimer);
       pollTimer = setTimeout(() => load(false), 3000);
@@ -699,7 +760,6 @@ async function load(forceRun) {
   }
 }
 
-// Kolon siralama
 document.querySelectorAll('#headrow th[data-sort]').forEach(th => {
   th.addEventListener('click', () => {
     const k = th.dataset.sort;
@@ -709,7 +769,6 @@ document.querySelectorAll('#headrow th[data-sort]').forEach(th => {
   });
 });
 
-// Periyot sekmeleri
 document.querySelectorAll('#tabs button').forEach(b => {
   b.addEventListener('click', () => {
     document.querySelectorAll('#tabs button').forEach(x => x.classList.remove('active'));
@@ -717,34 +776,39 @@ document.querySelectorAll('#tabs button').forEach(b => {
     currentPeriod = b.dataset.period;
     openCoin = null;
     updateDeepenBtn();
-    document.getElementById('tbody').innerHTML = '<tr><td colspan="7" class="empty">Yukleniyor...</td></tr>';
+    document.getElementById('tbody').innerHTML = '<tr><td colspan="8" class="empty">Yukleniyor...</td></tr>';
     load(false);
   });
 });
 
-// Arama
 document.getElementById('search').addEventListener('input', (e) => {
   searchTerm = e.target.value.trim().toLowerCase();
   renderTable();
 });
 
-// Celiski filtre
+document.getElementById('pumpBtn').addEventListener('click', () => {
+  pumpOnly = !pumpOnly;
+  if (pumpOnly) { dumpOnly = false; document.getElementById('dumpBtn').classList.remove('active'); }
+  document.getElementById('pumpBtn').classList.toggle('active', pumpOnly);
+  renderTable();
+});
+document.getElementById('dumpBtn').addEventListener('click', () => {
+  dumpOnly = !dumpOnly;
+  if (dumpOnly) { pumpOnly = false; document.getElementById('pumpBtn').classList.remove('active'); }
+  document.getElementById('dumpBtn').classList.toggle('active', dumpOnly);
+  renderTable();
+});
 document.getElementById('conflictBtn').addEventListener('click', () => {
   conflictOnly = !conflictOnly;
   document.getElementById('conflictBtn').classList.toggle('active', conflictOnly);
   renderTable();
 });
 
-// Derinlesme filtre (sadece 1H)
 function updateDeepenBtn() {
   const btn = document.getElementById('deepenBtn');
   if (currentPeriod !== '1h') {
-    deepenOnly = false;
-    btn.classList.remove('active');
-    btn.disabled = true;
-  } else {
-    btn.disabled = false;
-  }
+    deepenOnly = false; btn.classList.remove('active'); btn.disabled = true;
+  } else { btn.disabled = false; }
 }
 document.getElementById('deepenBtn').addEventListener('click', () => {
   if (currentPeriod !== '1h') return;
@@ -819,12 +883,9 @@ class ScrHandler(http.server.BaseHTTPRequestHandler):
             self._json(200, {"ok": True}); return
 
         if path == "/api/scan":
-            # v3: SADECE cache servis. Otomatik tarama YOK (sayfa acmak ban tetiklemesin).
-            # Tarama yalnizca /api/run-scan (cron) veya elle YENILE ile baslar.
             self._json(200, _scan_payload(period)); return
 
         if path == "/api/run-scan":
-            # Cron veya elle YENILE. Taranmiyor ise yeni tarama baslat (arka planda).
             st = _scan_state[period]
             if not st["scanning"]:
                 threading.Thread(target=run_scan, args=(period,), daemon=True).start()
@@ -847,7 +908,7 @@ class ThreadedServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
 
 
 def main():
-    print(f"L/S Divergence Screener v3 listening on {HOST}:{PORT}", flush=True)
+    print(f"L/S Divergence Screener v4 listening on {HOST}:{PORT}", flush=True)
     try:
         with ThreadedServer((HOST, PORT), ScrHandler) as srv:
             srv.serve_forever()
