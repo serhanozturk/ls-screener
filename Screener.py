@@ -1,5 +1,5 @@
 """
-L/S DIVERGENCE SCREENER (v5)
+L/S DIVERGENCE SCREENER (v6)
 =============================
 Binance futures'taki TUM USDT coinleri tarar; account(kalabalik) vs
 position(para) ayrismasi + ERKEN SINYAL (patlama/dusus adayi) tespiti.
@@ -17,6 +17,9 @@ v3 BAN DUZELTMELERI (korundu):
 - /api/series ban kontrolune bagli
 - exchangeInfo 6 saat cache
 
+v6: PATLAMA OI esigi %2 -> %10 (cok secici, az ama kesin patlama sinyali).
+   DUSUS OI esigi %2 ayni kaldi. Yeni Binance cagrisi YOK (sadece esik degeri).
+
 v5 BAN DUZELTMESI: KAYAN PENCERE RATE LIMITER
 - futures/data ailesi (account+position+openInterestHist) ortak 1000/5dk IP limiti
 - 3 istek x ~400 coin = 1200 > 1000 -> v4 ban sebebi
@@ -25,7 +28,7 @@ v5 BAN DUZELTMESI: KAYAN PENCERE RATE LIMITER
 
 v4: ERKEN SINYAL (patlama/dusus adayi)
 - OI degisimi: openInterestHist (weight 0), son 2 mum, taranan periyotla ayni
-- PATLAMA skoru (0-3): whale long + OI>=+%2 + funding<=0
+- PATLAMA skoru (0-3): whale long + OI>=+%10 + funding<=0
 - DUSUS skoru (0-3): whale short + OI<=-%2 + funding>=%0.05
 - 3/3 GUCLU, 2/3 ADAY. Ayri filtre butonlari + rozet + OI% kolonu.
 
@@ -49,7 +52,8 @@ HOST = "0.0.0.0"
 USER_AGENT = "Mozilla/5.0 LSScreener/1.0"
 
 # ===== Esikler (v4 erken sinyal) =====
-OI_CHANGE_MIN = 2.0       # OI degisim esigi % (patlama: >=+2, dusus: <=-2)
+OI_PUMP_MIN = 10.0        # PATLAMA OI esigi % (oi_chg >= +10, cok secici - az ama kesin)
+OI_DUMP_MIN = 2.0         # DUSUS OI esigi % (oi_chg <= -2, ralli bitiyor)
 FUNDING_HIGH = 0.05       # dusus: funding bu degerin ustu = asiri long kaldirac
 SCORE_CANDIDATE = 2       # >=2 aday, 3 guclu
 
@@ -212,17 +216,17 @@ def _fetch_oi_change(sym, period):
 
 def _early_signal(diff, oi_chg, funding):
     """Patlama/dusus skoru (0-3 her biri). Donus: (tip, skor) veya (None, 0).
-    PATLAMA: whale long + OI>=+2 + funding<=0
+    PATLAMA: whale long + OI>=+10 + funding<=0
     DUSUS:   whale short + OI<=-2 + funding>=0.05"""
     # Patlama skoru
     pump = 0
     if diff > 0: pump += 1                                  # whale long
-    if oi_chg is not None and oi_chg >= OI_CHANGE_MIN: pump += 1   # para giriyor
+    if oi_chg is not None and oi_chg >= OI_PUMP_MIN: pump += 1   # para giriyor (>=+10)
     if funding is not None and funding <= 0: pump += 1      # short yakiti
     # Dusus skoru
     dump = 0
     if diff < 0: dump += 1                                  # whale short
-    if oi_chg is not None and oi_chg <= -OI_CHANGE_MIN: dump += 1  # ralli bitiyor
+    if oi_chg is not None and oi_chg <= -OI_DUMP_MIN: dump += 1  # ralli bitiyor (<=-2)
     if funding is not None and funding >= FUNDING_HIGH: dump += 1  # asiri long kaldirac
     # En yuksek skoru olan tip kazanir (esitlikte ikisini de gosterme - net olani al)
     if pump >= SCORE_CANDIDATE and pump >= dump:
@@ -566,7 +570,7 @@ thead th { padding:7px 5px; font-size:9px; }
 <div class="info">
 <b>NE ISE YARAR?</b> Tum USDT futures coinlerinde ayrisma + erken sinyal (patlama/dusus) tarar.<br><br>
 &bull; <b>AYRISMA = position - account.</b> Pozitif = para kalabaliktan daha long (whale long).<br>
-&bull; <b>&#128640; PATLAMA</b> (0-3 skor): whale long + OI artisi(&ge;+2%) + funding&le;0 (short yakiti). Yukari potansiyel.<br>
+&bull; <b>&#128640; PATLAMA</b> (0-3 skor): whale long + OI artisi(&ge;+10%) + funding&le;0 (short yakiti). Yukari potansiyel.<br>
 &bull; <b>&#128201; DUSUS</b> (0-3 skor): whale short + OI dususu(&le;-2%) + funding&ge;0.05 (asiri long kaldirac). Tepe/sisme.<br>
 &bull; <b>&#9889; CELISKI</b>: para yonu funding'le ters. <b>&#8675; DERINLESEN</b> (1H): ayrisma ardisik buyuyor.<br>
 &bull; Listeye giren: |ayrisma|&ge;5 VEYA sinyal skoru&ge;2. Coine tikla = grafik. 30dk'da bir taranir. Finansal tavsiye degildir.
@@ -952,7 +956,7 @@ class ThreadedServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
 
 
 def main():
-    print(f"L/S Divergence Screener v5 listening on {HOST}:{PORT}", flush=True)
+    print(f"L/S Divergence Screener v6 listening on {HOST}:{PORT}", flush=True)
     try:
         with ThreadedServer((HOST, PORT), ScrHandler) as srv:
             srv.serve_forever()
