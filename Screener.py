@@ -241,8 +241,15 @@ def _telegram_send(text):
         }).encode("utf-8")
         req = urllib.request.Request(url, data=data, headers={"User-Agent": USER_AGENT})
         urllib.request.urlopen(req, timeout=10).read()
+    except urllib.error.HTTPError as e:
+        # Telegram'in dondurdugu gercek hata sebebini oku (400'un asil aciklamasi)
+        try:
+            body = e.read().decode("utf-8", "replace")
+        except Exception:
+            body = "(cevap okunamadi)"
+        print(f"[telegram] HTTP {e.code}: {body}", flush=True)
+        print(f"[telegram] gonderilen mesaj (ilk 200): {text[:200]!r}", flush=True)
     except Exception as e:
-        # Telegram hatasi taramayi etkilemesin - sadece logla
         print(f"[telegram] gonderim hatasi: {e}", flush=True)
 
 
