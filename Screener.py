@@ -1,5 +1,5 @@
 """
-L/S DIVERGENCE SCREENER (v7)
+L/S DIVERGENCE SCREENER (v8)
 =============================
 Binance futures'taki TUM USDT coinleri tarar; account(kalabalik) vs
 position(para) ayrismasi + ERKEN SINYAL (patlama/dusus adayi) tespiti.
@@ -16,6 +16,11 @@ v3 BAN DUZELTMELERI (korundu):
 - /api/scan otomatik tarama tetiklemez
 - /api/series ban kontrolune bagli
 - exchangeInfo 6 saat cache
+
+v8: TELEGRAM bildirimi - sadece 1h taramasinda PATLAMA adaylari (skor 1+) bildirilir.
+   Dedup YOK (her 1h taramada patlama varsa gonderir). Token/chat env'de
+   (TELEGRAM_TOKEN, TELEGRAM_CHAT_ID), KODA gomulu DEGIL. Telegram'a gider,
+   Binance'e degil -> ban riski YOK. Dusus/15m bildirimi YOK.
 
 v7: PATLAMA icin OI>=%10 ZORUNLU KAPI oldu (gecmezse patlama adayi degil).
    OI tek basina aday yapar; whale long + funding skoru yukseltir. DUSUS degismedi.
@@ -52,6 +57,11 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 PORT = int(os.environ.get("PORT", 8766))
 HOST = "0.0.0.0"
 USER_AGENT = "Mozilla/5.0 LSScreener/1.0"
+
+# ===== Telegram bildirimi (v8) - sadece 1h patlama =====
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+TELEGRAM_ENABLED = bool(TELEGRAM_TOKEN and TELEGRAM_CHAT_ID)
 
 # ===== Esikler (v4 erken sinyal) =====
 OI_PUMP_MIN = 10.0        # PATLAMA OI esigi % (oi_chg >= +10, cok secici - az ama kesin)
@@ -214,6 +224,47 @@ def _fetch_oi_change(sym, period):
     except Exception:
         pass
     return None
+
+
+def _telegram_send(text):
+    """Telegram'a mesaj gonderir. Token/chat yoksa sessizce gecer.
+    Binance'e DEGIL Telegram'a gider - ban riski yok. Hata olursa tarama bozulmaz."""
+    if not TELEGRAM_ENABLED:
+        return
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+        data = urllib.parse.urlencode({
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": text,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": "true",
+        }).encode("utf-8")
+        req = urllib.request.Request(url, data=data, headers={"User-Agent": USER_AGENT})
+        urllib.request.urlopen(req, timeout=10).read()
+    except Exception as e:
+        # Telegram hatasi taramayi etkilemesin - sadece logla
+        print(f"[telegram] gonderim hatasi: {e}", flush=True)
+
+
+def _build_pump_message(pumps):
+    """1h patlama adaylarindan Telegram mesaji olusturur. pumps: result listesi (signalType==PATLAMA)."""
+    lines = ["\U0001F680 <b>PATLAMA</b> \u2014 1H", ""]
+    for r in pumps:
+        sym = r["symbol"]
+        oi = r.get("oiChange")
+        oi_s = f"+{oi:.1f}%" if oi is not None else "n/a"
+        div = r["divergence"]
+        div_s = f"{'+' if div >= 0 else ''}{div}"
+        fund = r.get("funding")
+        fund_s = f"{fund:+.4f}%" if fund is not None else "n/a"
+        score = r.get("signalScore", 0)
+        lines.append(f"<b>{sym}/USDT</b>")
+        lines.append(f"OI: {oi_s} (kontrat)")
+        lines.append(f"Ayrisma: {div_s}")
+        lines.append(f"Funding: {fund_s}")
+        lines.append(f"Skor: {score}/3")
+        lines.append("")
+    return "\n".join(lines).strip()
 
 
 def _early_signal(diff, oi_chg, funding):
@@ -405,6 +456,13 @@ def run_scan(period):
             if period == "1h":
                 for r in results:
                     _div_history[r["symbol"]] = r["divergence"]
+
+        # v8: Sadece 1h taramasinda patlama adaylarini Telegram'a bildir (dedup YOK)
+        if period == "1h" and TELEGRAM_ENABLED:
+            pumps = [r for r in results if r.get("signalType") == "PATLAMA"]
+            if pumps:
+                _telegram_send(_build_pump_message(pumps))
+
         return {"ok": True, "count": len(results)}
     except Exception as e:
         st["error"] = str(e)
@@ -967,7 +1025,7 @@ class ThreadedServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
 
 
 def main():
-    print(f"L/S Divergence Screener v7 listening on {HOST}:{PORT}", flush=True)
+    print(f"L/S Divergence Screener v8 listening on {HOST}:{PORT}", flush=True)
     try:
         with ThreadedServer((HOST, PORT), ScrHandler) as srv:
             srv.serve_forever()
