@@ -1,5 +1,5 @@
 """
-L/S DIVERGENCE SCREENER (v8)
+L/S DIVERGENCE SCREENER (v9)
 =============================
 Binance futures'taki TUM USDT coinleri tarar; account(kalabalik) vs
 position(para) ayrismasi + ERKEN SINYAL (patlama/dusus adayi) tespiti.
@@ -1013,8 +1013,7 @@ class ScrHandler(http.server.BaseHTTPRequestHandler):
             st = _scan_state[period]
             if not st["scanning"]:
                 threading.Thread(target=run_scan, args=(period,), daemon=True).start()
-                time.sleep(0.3)
-            self._json(200, _scan_payload(period)); return
+            self._json(200, {"ok": True, "started": not st["scanning"], "period": period}); return
 
         if path == "/api/series":
             sym = (q.get("symbol", [""])[0] or "").strip()
@@ -1032,7 +1031,7 @@ class ThreadedServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
 
 
 def main():
-    print(f"L/S Divergence Screener v8 listening on {HOST}:{PORT}", flush=True)
+    print(f"L/S Divergence Screener v9 listening on {HOST}:{PORT}", flush=True)
     try:
         with ThreadedServer((HOST, PORT), ScrHandler) as srv:
             srv.serve_forever()
