@@ -1,5 +1,5 @@
 """
-L/S DIVERGENCE SCREENER (v9)
+L/S DIVERGENCE SCREENER (v10)
 =============================
 Binance futures'taki TUM USDT coinleri tarar; account(kalabalik) vs
 position(para) ayrismasi + ERKEN SINYAL (patlama/dusus adayi) tespiti.
@@ -17,9 +17,14 @@ v3 BAN DUZELTMELERI (korundu):
 - /api/series ban kontrolune bagli
 - exchangeInfo 6 saat cache
 
+v10: TELEGRAM_CHAT_IDS coklu liste (virgullu) - birden fazla kisiye bildirim,
+   her chat_id'ye AYRI istek (biri basarisiz olsa digerini etkilemez).
+v9: /api/run-scan kucuk response doner ({"ok":true,...}) - eskiden tum tarama
+   JSON'unu donduruyordu, cron-job.org "output too large" hatasi veriyordu.
+
 v8: TELEGRAM bildirimi - sadece 1h taramasinda PATLAMA adaylari (skor 1+) bildirilir.
    Dedup YOK (her 1h taramada patlama varsa gonderir). Token/chat env'de
-   (TELEGRAM_TOKEN, TELEGRAM_CHAT_ID), KODA gomulu DEGIL. Telegram'a gider,
+   (TELEGRAM_TOKEN, TELEGRAM_CHAT_IDS - virgullu liste), KODA gomulu DEGIL. Telegram'a gider,
    Binance'e degil -> ban riski YOK. Dusus/15m bildirimi YOK.
 
 v7: PATLAMA icin OI>=%10 ZORUNLU KAPI oldu (gecmezse patlama adayi degil).
@@ -60,8 +65,8 @@ USER_AGENT = "Mozilla/5.0 LSScreener/1.0"
 
 # ===== Telegram bildirimi (v8) - sadece 1h patlama =====
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
-TELEGRAM_ENABLED = bool(TELEGRAM_TOKEN and TELEGRAM_CHAT_ID)
+TELEGRAM_CHAT_IDS = [c.strip() for c in os.environ.get("TELEGRAM_CHAT_IDS", "").split(",") if c.strip()]
+TELEGRAM_ENABLED = bool(TELEGRAM_TOKEN and TELEGRAM_CHAT_IDS)
 
 # ===== Esikler (v4 erken sinyal) =====
 OI_PUMP_MIN = 10.0        # PATLAMA OI esigi % (oi_chg >= +10, cok secici - az ama kesin)
@@ -228,29 +233,30 @@ def _fetch_oi_change(sym, period):
 
 def _telegram_send(text):
     """Telegram'a mesaj gonderir. Token/chat yoksa sessizce gecer.
+    Her chat_id'ye AYRI istek atilir (biri basarisiz olsa digerini etkilemez).
     Binance'e DEGIL Telegram'a gider - ban riski yok. Hata olursa tarama bozulmaz."""
     if not TELEGRAM_ENABLED:
         return
-    try:
-        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-        data = urllib.parse.urlencode({
-            "chat_id": TELEGRAM_CHAT_ID,
-            "text": text,
-            "parse_mode": "HTML",
-            "disable_web_page_preview": "true",
-        }).encode("utf-8")
-        req = urllib.request.Request(url, data=data, headers={"User-Agent": USER_AGENT})
-        urllib.request.urlopen(req, timeout=10).read()
-    except urllib.error.HTTPError as e:
-        # Telegram'in dondurdugu gercek hata sebebini oku (400'un asil aciklamasi)
+    for chat_id in TELEGRAM_CHAT_IDS:
         try:
-            body = e.read().decode("utf-8", "replace")
-        except Exception:
-            body = "(cevap okunamadi)"
-        print(f"[telegram] HTTP {e.code}: {body}", flush=True)
-        print(f"[telegram] gonderilen mesaj (ilk 200): {text[:200]!r}", flush=True)
-    except Exception as e:
-        print(f"[telegram] gonderim hatasi: {e}", flush=True)
+            url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+            data = urllib.parse.urlencode({
+                "chat_id": chat_id,
+                "text": text,
+                "parse_mode": "HTML",
+                "disable_web_page_preview": "true",
+            }).encode("utf-8")
+            req = urllib.request.Request(url, data=data, headers={"User-Agent": USER_AGENT})
+            urllib.request.urlopen(req, timeout=10).read()
+        except urllib.error.HTTPError as e:
+            # Telegram'in dondurdugu gercek hata sebebini oku (400'un asil aciklamasi)
+            try:
+                body = e.read().decode("utf-8", "replace")
+            except Exception:
+                body = "(cevap okunamadi)"
+            print(f"[telegram] chat_id={chat_id} HTTP {e.code}: {body}", flush=True)
+        except Exception as e:
+            print(f"[telegram] chat_id={chat_id} gonderim hatasi: {e}", flush=True)
 
 
 def _build_pump_message(pumps):
@@ -1031,7 +1037,7 @@ class ThreadedServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
 
 
 def main():
-    print(f"L/S Divergence Screener v9 listening on {HOST}:{PORT}", flush=True)
+    print(f"L/S Divergence Screener v10 listening on {HOST}:{PORT}", flush=True)
     try:
         with ThreadedServer((HOST, PORT), ScrHandler) as srv:
             srv.serve_forever()
