@@ -1,5 +1,5 @@
 """
-L/S DIVERGENCE SCREENER (v10)
+L/S DIVERGENCE SCREENER (v11)
 =============================
 Binance futures'taki TUM USDT coinleri tarar; account(kalabalik) vs
 position(para) ayrismasi + ERKEN SINYAL (patlama/dusus adayi) tespiti.
@@ -17,6 +17,13 @@ v3 BAN DUZELTMELERI (korundu):
 - /api/series ban kontrolune bagli
 - exchangeInfo 6 saat cache
 
+v11: ERKEN YAKALAMA - (1) PATLAMA kapisi: son mum VEYA son 3 mum kumulatif OI
+   (limit=4, ayni istek, weight 0 - ekstra ban riski YOK). Kademeli birikimler
+   (orn 3x%4) artik kacmaz, tek mum sicramalari da eskisi gibi yakalanir.
+   (2) 15m taramasi da Telegram bildirir, esik %5 (1h %10). Baslikta tag: 1H/15M.
+   (3) Bildirimde son fiyat (premiumIndex markPrice - ayni cagri, ekstra istek yok).
+   (4) 15m dedup: ayni coin 2 saat icinde tekrar bildirilmez (skor artmadikca).
+       1h dedup'suz kaldi (mevcut davranis).
 v10: TELEGRAM_CHAT_IDS coklu liste (virgullu) - birden fazla kisiye bildirim,
    her chat_id'ye AYRI istek (biri basarisiz olsa digerini etkilemez).
 v9: /api/run-scan kucuk response doner ({"ok":true,...}) - eskiden tum tarama
@@ -69,7 +76,9 @@ TELEGRAM_CHAT_IDS = [c.strip() for c in os.environ.get("TELEGRAM_CHAT_IDS", "").
 TELEGRAM_ENABLED = bool(TELEGRAM_TOKEN and TELEGRAM_CHAT_IDS)
 
 # ===== Esikler (v4 erken sinyal) =====
-OI_PUMP_MIN = 10.0        # PATLAMA OI esigi % (oi_chg >= +10, cok secici - az ama kesin)
+OI_PUMP_MIN = 10.0        # PATLAMA OI esigi % - 1h (son mum VEYA 3 mum kumulatif >= +10)
+OI_PUMP_MIN_15M = 5.0     # PATLAMA OI esigi % - 15m (son mum VEYA 3 mum kumulatif >= +5)
+PUMP_DEDUP_SEC = 7200     # 15m patlama dedup: ayni coin 2 saat icinde tekrar bildirilmez (skor artmadikca)
 OI_DUMP_MIN = 2.0         # DUSUS OI esigi % (oi_chg <= -2, ralli bitiyor)
 FUNDING_HIGH = 0.05       # dusus: funding bu degerin ustu = asiri long kaldirac
 SCORE_CANDIDATE = 2       # >=2 aday, 3 guclu
@@ -173,6 +182,10 @@ _EXCHANGE_TTL = 6 * 3600
 # ===== Derinlesen ayrisma gecmisi (SADECE 1h, bellekte) =====
 _div_history = {}
 
+# ===== 15m patlama bildirim dedup (bellekte, restart'ta sifirlanir) =====
+# {symbol: (son_bildirim_ts, skor)} - PUMP_DEDUP_SEC icinde ayni coin tekrar bildirilmez (skor artmadikca)
+_pump_notified_15m = {}
+
 
 def get_usdt_symbols():
     """Tum aktif USDT perpetual futures sembolleri (exchangeInfo, 6 saat cache)."""
@@ -198,37 +211,52 @@ def get_usdt_symbols():
 
 
 def get_all_funding():
-    """TUM sembollerin funding'i TEK toplu cagri (premiumIndex symbol'suz, weight 10)."""
+    """TUM sembollerin funding'i + markPrice'i TEK toplu cagri (premiumIndex symbol'suz, weight 10).
+    Donus: (funding_map, price_map). Ekstra istek YOK - ayni cevaptan iki alan okunur."""
     out = {}
+    prices = {}
     try:
         data = http_get("https://fapi.binance.com/fapi/v1/premiumIndex", timeout=15)
     except Exception:
-        return out
+        return out, prices
     if isinstance(data, list):
         for d in data:
             sym = d.get("symbol")
             fr = d.get("lastFundingRate")
+            mp = d.get("markPrice")
             if sym and fr not in (None, ""):
                 try:
                     out[sym] = float(fr) * 100
                 except Exception:
                     pass
-    return out
+            if sym and mp not in (None, ""):
+                try:
+                    prices[sym] = float(mp)
+                except Exception:
+                    pass
+    return out, prices
 
 
 def _fetch_oi_change(sym, period):
-    """OI degisimi: openInterestHist (weight 0), son 2 mum. Donus % veya None.
-    Kontrat (sumOpenInterest) bazli - notional degil (fiyat cift saymaz)."""
+    """OI degisimi: openInterestHist (weight 0), limit=4 - AYNI istek sayisi.
+    Donus: (son_mum_degisimi_%, 3_mum_kumulatif_%) - herbiri None olabilir.
+    Kontrat (sumOpenInterest) bazli - notional degil (fiyat cift saymaz).
+    Kumulatif: kademeli birikimleri yakalar (orn 3x%4 = tekil kapiyi gecmez ama toplam %12)."""
     try:
-        j = http_get(f"https://fapi.binance.com/futures/data/openInterestHist?symbol={sym}&period={period}&limit=2")
+        j = http_get(f"https://fapi.binance.com/futures/data/openInterestHist?symbol={sym}&period={period}&limit=4")
         if isinstance(j, list) and len(j) >= 2:
             prev = float(j[-2].get("sumOpenInterest") or 0)
             now = float(j[-1].get("sumOpenInterest") or 0)
-            if prev > 0:
-                return round((now - prev) / prev * 100, 2)
+            last = round((now - prev) / prev * 100, 2) if prev > 0 else None
+            cum = None
+            if len(j) >= 4:
+                base = float(j[-4].get("sumOpenInterest") or 0)
+                if base > 0:
+                    cum = round((now - base) / base * 100, 2)
+            return last, cum
     except Exception:
         pass
-    return None
+    return None, None
 
 
 def _telegram_send(text):
@@ -259,20 +287,32 @@ def _telegram_send(text):
             print(f"[telegram] chat_id={chat_id} gonderim hatasi: {e}", flush=True)
 
 
-def _build_pump_message(pumps):
-    """1h patlama adaylarindan Telegram mesaji olusturur. pumps: result listesi (signalType==PATLAMA)."""
-    lines = ["\U0001F680 <b>PATLAMA</b> \u2014 1H", ""]
+def _fmt_price(p):
+    """Fiyati anlamli basamakla formatlar (kucuk coinlerde 0.001938 gibi)."""
+    if p is None:
+        return "n/a"
+    if p >= 1000: return f"{p:,.1f}"
+    if p >= 1: return f"{p:.4f}"
+    return f"{p:.8f}".rstrip("0")
+
+
+def _build_pump_message(pumps, period):
+    """Patlama adaylarindan Telegram mesaji. Baslikta periyot tag'i (1H / 15M)."""
+    tag = "1H" if period == "1h" else "15M"
+    lines = [f"\U0001F680 <b>PATLAMA</b> \u2014 {tag}", ""]
     for r in pumps:
         sym = r["symbol"]
         oi = r.get("oiChange")
         oi_s = f"+{oi:.1f}%" if oi is not None else "n/a"
+        cum = r.get("oiCum")
+        cum_s = f" (3 mum: +{cum:.1f}%)" if cum is not None and cum > 0 else ""
         div = r["divergence"]
         div_s = f"{'+' if div >= 0 else ''}{div}"
         fund = r.get("funding")
         fund_s = f"{fund:+.4f}%" if fund is not None else "n/a"
         score = r.get("signalScore", 0)
-        lines.append(f"<b>{sym}/USDT</b>")
-        lines.append(f"OI: {oi_s} (kontrat)")
+        lines.append(f"<b>{sym}/USDT</b> \u2014 {_fmt_price(r.get('price'))}")
+        lines.append(f"OI: {oi_s}{cum_s} (kontrat)")
         lines.append(f"Ayrisma: {div_s}")
         lines.append(f"Funding: {fund_s}")
         lines.append(f"Skor: {score}/3")
@@ -280,19 +320,23 @@ def _build_pump_message(pumps):
     return "\n".join(lines).strip()
 
 
-def _early_signal(diff, oi_chg, funding):
+def _early_signal(diff, oi_chg, oi_cum, funding, pump_min):
     """Patlama/dusus skoru. Donus: (tip, skor) veya (None, 0).
-    PATLAMA: OI>=+10 ZORUNLU KAPI (gecmezse patlama yok). Gecerse tek basina aday;
-             whale long ve funding<=0 skoru yukseltir (1-3).
-    DUSUS:   whale short + OI<=-2 + funding>=0.05 (skor sistemi, >=2 aday)."""
-    # ---- PATLAMA: OI>=%10 zorunlu giris sarti ----
+    PATLAMA: son mum OI >= pump_min VEYA 3 mum kumulatif OI >= pump_min -> ZORUNLU KAPI.
+             (VEYA mantigi: ani sicrama da kademeli birikim de yakalanir, ikisi de kacmaz)
+             Gecerse tek basina aday; whale long ve funding<=0 skoru yukseltir (1-3).
+    DUSUS:   whale short + OI<=-2 + funding>=0.05 (skor sistemi, >=2 aday).
+    pump_min: 1h=10.0, 15m=5.0 (periyoda gore)."""
+    # ---- PATLAMA: son mum VEYA kumulatif kapiyi acar ----
     pump = 0
-    if oi_chg is not None and oi_chg >= OI_PUMP_MIN:
+    gate = ((oi_chg is not None and oi_chg >= pump_min)
+            or (oi_cum is not None and oi_cum >= pump_min))
+    if gate:
         # kapi acildi: OI tek basina aday yapar (+1), digerleri skoru yukseltir
         pump = 1
         if diff > 0: pump += 1                              # whale long
         if funding is not None and funding <= 0: pump += 1  # short yakiti
-    # OI %10 gecmediyse pump = 0 (patlama adayi DEGIL)
+    # Kapi acilmadiysa pump = 0 (patlama adayi DEGIL)
 
     # ---- DUSUS: skor sistemi (degismedi) ----
     dump = 0
@@ -308,9 +352,9 @@ def _early_signal(diff, oi_chg, funding):
     return (None, 0)
 
 
-def _fetch_pair(sym, period, funding_map):
+def _fetch_pair(sym, period, funding_map, price_map):
     """Bir coin icin account + position (weight=0) + OI degisimi (weight=0).
-    Funding toplu map'ten. Donus dict veya None."""
+    Funding ve fiyat toplu map'lerden. Donus dict veya None."""
     acc = pos = None
     try:
         j = http_get(f"https://fapi.binance.com/futures/data/globalLongShortAccountRatio?symbol={sym}&period={period}&limit=1")
@@ -327,7 +371,8 @@ def _fetch_pair(sym, period, funding_map):
     if acc is None or pos is None:
         return None
     funding = funding_map.get(sym)
-    oi_chg = _fetch_oi_change(sym, period)  # weight 0
+    price = price_map.get(sym)
+    oi_chg, oi_cum = _fetch_oi_change(sym, period)  # weight 0, limit=4
     diff = pos - acc
 
     return {
@@ -337,6 +382,8 @@ def _fetch_pair(sym, period, funding_map):
         "divergence": round(diff, 2),
         "funding": round(funding, 4) if funding is not None else None,
         "oiChange": oi_chg,
+        "oiCum": oi_cum,
+        "price": price,
     }
 
 
@@ -411,11 +458,12 @@ def run_scan(period):
         syms = get_usdt_symbols()
         st["total"] = len(syms)
 
-        funding_map = get_all_funding()
+        funding_map, price_map = get_all_funding()
         if _binance_banned():
             st["error"] = "Binance banli (funding cagrisi), tarama iptal"
             return {"ok": False, "error": st["error"]}
 
+        pump_min = OI_PUMP_MIN if period == "1h" else OI_PUMP_MIN_15M
         results = []
         BATCH = 5
         for i in range(0, len(syms), BATCH):
@@ -424,13 +472,13 @@ def run_scan(period):
                 break
             batch = syms[i:i+BATCH]
             with ThreadPoolExecutor(max_workers=BATCH) as ex:
-                futs = {ex.submit(_fetch_pair, s, period, funding_map): s for s in batch}
+                futs = {ex.submit(_fetch_pair, s, period, funding_map, price_map): s for s in batch}
                 for f in as_completed(futs):
                     r = f.result()
                     if not r:
                         continue
-                    # Erken sinyal skoru
-                    sig_type, sig_score = _early_signal(r["divergence"], r["oiChange"], r["funding"])
+                    # Erken sinyal skoru (kapi: son mum VEYA 3 mum kumulatif >= pump_min)
+                    sig_type, sig_score = _early_signal(r["divergence"], r["oiChange"], r["oiCum"], r["funding"], pump_min)
                     r["signalType"] = sig_type      # PATLAMA / DUSUS / None
                     r["signalScore"] = sig_score    # patlama 1-3, dusus 2-3
                     # Listeye girme: ayrisma>=5 VEYA patlama (OI %10 kapisi gecti, skor 1+)
@@ -470,11 +518,28 @@ def run_scan(period):
                 for r in results:
                     _div_history[r["symbol"]] = r["divergence"]
 
-        # v8: Sadece 1h taramasinda patlama adaylarini Telegram'a bildir (dedup YOK)
-        if period == "1h" and TELEGRAM_ENABLED:
+        # v11: Her iki periyotta patlama bildirimi. Baslikta tag (1H/15M) + fiyat.
+        # 15m dedup: ayni coin PUMP_DEDUP_SEC icinde tekrar bildirilmez (skor artmadikca).
+        # 1h dedup'suz (mevcut davranis korundu).
+        if TELEGRAM_ENABLED:
             pumps = [r for r in results if r.get("signalType") == "PATLAMA"]
+            if period == "15m" and pumps:
+                now_ts = time.time()
+                fresh = []
+                with _scan_lock:
+                    for r in pumps:
+                        key = r["symbol"]
+                        prev = _pump_notified_15m.get(key)
+                        if prev is None or (now_ts - prev[0]) >= PUMP_DEDUP_SEC or r.get("signalScore", 0) > prev[1]:
+                            fresh.append(r)
+                            _pump_notified_15m[key] = (now_ts, r.get("signalScore", 0))
+                    # pruning: suresi cok gecmis kayitlari at (bellek buyumesin)
+                    cutoff = now_ts - PUMP_DEDUP_SEC * 2
+                    for k in [k for k, v in _pump_notified_15m.items() if v[0] < cutoff]:
+                        del _pump_notified_15m[k]
+                pumps = fresh
             if pumps:
-                _telegram_send(_build_pump_message(pumps))
+                _telegram_send(_build_pump_message(pumps, period))
 
         return {"ok": True, "count": len(results)}
     except Exception as e:
@@ -1017,9 +1082,10 @@ class ScrHandler(http.server.BaseHTTPRequestHandler):
 
         if path == "/api/run-scan":
             st = _scan_state[period]
-            if not st["scanning"]:
+            was_idle = not st["scanning"]
+            if was_idle:
                 threading.Thread(target=run_scan, args=(period,), daemon=True).start()
-            self._json(200, {"ok": True, "started": not st["scanning"], "period": period}); return
+            self._json(200, {"ok": True, "started": was_idle, "period": period}); return
 
         if path == "/api/series":
             sym = (q.get("symbol", [""])[0] or "").strip()
@@ -1037,7 +1103,7 @@ class ThreadedServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
 
 
 def main():
-    print(f"L/S Divergence Screener v10 listening on {HOST}:{PORT}", flush=True)
+    print(f"L/S Divergence Screener v11 listening on {HOST}:{PORT}", flush=True)
     try:
         with ThreadedServer((HOST, PORT), ScrHandler) as srv:
             srv.serve_forever()
