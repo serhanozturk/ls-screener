@@ -1,5 +1,5 @@
 """
-L/S DIVERGENCE SCREENER (v13)
+L/S DIVERGENCE SCREENER (v14)
 =============================
 Binance futures'taki TUM USDT coinleri tarar; account(kalabalik) vs
 position(para) ayrismasi + ERKEN SINYAL (patlama/dusus adayi) tespiti.
@@ -24,6 +24,10 @@ v11: ERKEN YAKALAMA - (1) PATLAMA kapisi: son mum VEYA son 3 mum kumulatif OI
    (3) Bildirimde son fiyat (premiumIndex markPrice - ayni cagri, ekstra istek yok).
    (4) 15m dedup: ayni coin 2 saat icinde tekrar bildirilmez (skor artmadikca).
        1h dedup'suz kaldi (mevcut davranis).
+v14: ERKEN UYARI sadece KRIPTO perpetual tarar - ticker/24hr'daki TRADIFI_PERPETUAL
+   (tokenize hisse: IREN, vb. underlyingType=EQUITY) sembolleri elenir.
+   Filtre: aday sembol get_usdt_symbols() setinde olmali (6h cache, ekstra istek yok).
+   Ana tarama zaten PERPETUAL filtreliydi - iki sistem artik tutarli.
 v13: SUPABASE sinyal kaydi (backtest icin) - her EARLY ve PATLAMA sinyali aninda
    screener_signals tablosuna tek INSERT (dedup'a takilanlar dahil, notified kolonu ayirir).
    Env: SUPABASE_URL + SUPABASE_KEY (yoksa sessizce atlanir, davranis degismez).
@@ -365,7 +369,11 @@ def _early_prefilter():
     Her kontrolde tum coinlerin 24h quoteVolume'u okunur; onceki kontrolle fark =
     son ~15dk'da eklenen hacim. Delta hem kendi gecmis ortalamasinin EARLY_PRE_X
     katini hem EARLY_PRE_MIN'i gecerse aday. Kesin karar 2. asamada (klines).
-    Donus: (aday_listesi, fiyat_map). Ilk kontrol warmup'tir (aday cikmaz)."""
+    Donus: (aday_listesi, fiyat_map). Ilk kontrol warmup'tir (aday cikmaz).
+    v14: SADECE kripto perpetual (get_usdt_symbols seti). ticker/24hr TRADIFI_PERPETUAL
+    (tokenize hisse, orn IRENUSDT) sembollerini de dondurur - onlar ELENIR
+    (exchangeInfo contractType==PERPETUAL filtresi; 6h cache, ekstra istek YOK)."""
+    allowed = set(get_usdt_symbols())  # kripto perp seti (hisse perp'leri DISARIDA)
     data = http_get("https://fapi.binance.com/fapi/v1/ticker/24hr", timeout=15)
     if not isinstance(data, list):
         return [], {}
@@ -373,7 +381,7 @@ def _early_prefilter():
     prices = {}
     for d in data:
         sym = d.get("symbol", "")
-        if not sym.endswith("USDT"):
+        if sym not in allowed:
             continue
         try:
             qv = float(d.get("quoteVolume") or 0)
@@ -1415,7 +1423,7 @@ class ThreadedServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
 
 
 def main():
-    print(f"L/S Divergence Screener v13 listening on {HOST}:{PORT}", flush=True)
+    print(f"L/S Divergence Screener v14 listening on {HOST}:{PORT}", flush=True)
     try:
         with ThreadedServer((HOST, PORT), ScrHandler) as srv:
             srv.serve_forever()
