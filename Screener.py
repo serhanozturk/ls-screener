@@ -1,5 +1,5 @@
 """
-L/S DIVERGENCE SCREENER (v11)
+L/S DIVERGENCE SCREENER (v13)
 =============================
 Binance futures'taki TUM USDT coinleri tarar; account(kalabalik) vs
 position(para) ayrismasi + ERKEN SINYAL (patlama/dusus adayi) tespiti.
@@ -24,6 +24,19 @@ v11: ERKEN YAKALAMA - (1) PATLAMA kapisi: son mum VEYA son 3 mum kumulatif OI
    (3) Bildirimde son fiyat (premiumIndex markPrice - ayni cagri, ekstra istek yok).
    (4) 15m dedup: ayni coin 2 saat icinde tekrar bildirilmez (skor artmadikca).
        1h dedup'suz kaldi (mevcut davranis).
+v13: SUPABASE sinyal kaydi (backtest icin) - her EARLY ve PATLAMA sinyali aninda
+   screener_signals tablosuna tek INSERT (dedup'a takilanlar dahil, notified kolonu ayirir).
+   Env: SUPABASE_URL + SUPABASE_KEY (yoksa sessizce atlanir, davranis degismez).
+   Supabase'e gider, Binance'e degil - ban etkisi SIFIR. Sonuc olcumu (1h/4h/24h sonrasi)
+   kayit aninda YAPILMAZ - backtest analizinde toptan cekilir (Secenek A).
+v12: ERKEN UYARI sistemi - hacim + taker buy patlamasi tespiti (PATLAMA'dan once):
+   Kural (VE): mum hacmi >= 5x son 8 mum ort. + takerBuy >= 5x ort. + hacim >= 100K USDT.
+   Fiyat sarti YOK (gizli toplama kacmasin). 2 asama: bulk ticker on eleme (weight 40)
+   -> adaylara klines (weight 1'er). futures/data butcesine DOKUNMAZ, toplam ~40-70 weight.
+   /api/early-check endpoint'i, AYRI cron (15dk'da bir: dakika 3,18,33,48).
+   Telegram: ayri "ERKEN UYARI - 15M" mesaji, 2 saat dedup, sessiz dusur.
+   PATLAMA mesajina TEYIT notu: coin son 6 saatte erken uyari aldiysa saat+fiyat+degisim.
+   Dashboard 15m sekmesinde ERKEN UYARI kutusu.
 v10: TELEGRAM_CHAT_IDS coklu liste (virgullu) - birden fazla kisiye bildirim,
    her chat_id'ye AYRI istek (biri basarisiz olsa digerini etkilemez).
 v9: /api/run-scan kucuk response doner ({"ok":true,...}) - eskiden tum tarama
@@ -75,6 +88,13 @@ TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_IDS = [c.strip() for c in os.environ.get("TELEGRAM_CHAT_IDS", "").split(",") if c.strip()]
 TELEGRAM_ENABLED = bool(TELEGRAM_TOKEN and TELEGRAM_CHAT_IDS)
 
+# ===== Supabase sinyal kaydi (v13, backtest icin) =====
+# Env yoksa sistem SESSIZCE kayit atlar - mevcut davranis bozulmaz.
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "").rstrip("/")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
+SUPA_ENABLED = bool(SUPABASE_URL and SUPABASE_KEY)
+SUPA_TABLE = "screener_signals"
+
 # ===== Esikler (v4 erken sinyal) =====
 OI_PUMP_MIN = 10.0        # PATLAMA OI esigi % - 1h (son mum VEYA 3 mum kumulatif >= +10)
 OI_PUMP_MIN_15M = 5.0     # PATLAMA OI esigi % - 15m (son mum VEYA 3 mum kumulatif >= +5)
@@ -82,6 +102,17 @@ PUMP_DEDUP_SEC = 7200     # 15m patlama dedup: ayni coin 2 saat icinde tekrar bi
 OI_DUMP_MIN = 2.0         # DUSUS OI esigi % (oi_chg <= -2, ralli bitiyor)
 FUNDING_HIGH = 0.05       # dusus: funding bu degerin ustu = asiri long kaldirac
 SCORE_CANDIDATE = 2       # >=2 aday, 3 guclu
+
+# ===== ERKEN UYARI esikleri (v12) =====
+EARLY_VOL_X = 5.0         # mum hacmi >= 5x son 8 mum ortalamasi
+EARLY_TB_X = 5.0          # taker buy >= 5x son 8 mum ortalamasi
+EARLY_MIN_VOL = 100_000   # mutlak taban: mum hacmi >= 100K USDT (olu coin filtresi)
+EARLY_BASE_N = 8          # taban ortalamasi mum sayisi (2 saat)
+EARLY_DEDUP_SEC = 7200    # ayni coin 2 saat icinde tekrar bildirilmez
+EARLY_ALERT_KEEP = 21600  # erken uyari kaydi 6 saat tutulur (PATLAMA teyit referansi icin)
+EARLY_PRE_X = 3.0         # on eleme: ticker delta >= 3x kendi ortalamasi (genis ag)
+EARLY_PRE_MIN = 40_000    # on eleme: 15dk delta >= 40K USDT (genis ag, kesin kontrol klines'ta)
+EARLY_MAX_CANDIDATES = 30 # tek kontrolde en fazla 30 aday klines cekilir (weight siniri)
 
 # ===== Binance yerel ban takibi =====
 _ban_until = 0.0
@@ -186,6 +217,18 @@ _div_history = {}
 # {symbol: (son_bildirim_ts, skor)} - PUMP_DEDUP_SEC icinde ayni coin tekrar bildirilmez (skor artmadikca)
 _pump_notified_15m = {}
 
+# ===== ERKEN UYARI durumu (v12, bellekte) =====
+# _ticker_hist: {symbol: [delta1, delta2, ...]} - 15dk'lik hacim deltalari (on eleme taban cizgisi)
+# _ticker_prev: {symbol: son_quoteVolume} - bir onceki kontroldeki 24h hacim
+# _early_notified: {symbol: son_bildirim_ts} - dedup
+# _early_alerts: {symbol: (ts, fiyat)} - PATLAMA teyit referansi (6 saat tutulur)
+# _early_state: dashboard icin son kontrol sonuclari
+_ticker_hist = {}
+_ticker_prev = {}
+_early_notified = {}
+_early_alerts = {}
+_early_state = {"ts": 0, "results": [], "checking": False, "error": None}
+
 
 def get_usdt_symbols():
     """Tum aktif USDT perpetual futures sembolleri (exchangeInfo, 6 saat cache)."""
@@ -259,6 +302,36 @@ def _fetch_oi_change(sym, period):
     return None, None
 
 
+def _supa_log(rows):
+    """Sinyal satirlarini Supabase'e TEK istekte yazar (backtest icin, v13).
+    Supabase'e gider, Binance'e DEGIL - ban etkisi SIFIR.
+    Hata olursa sadece log basar, tarama/bildirim ASLA bozulmaz."""
+    if not SUPA_ENABLED or not rows:
+        return
+    try:
+        url = f"{SUPABASE_URL}/rest/v1/{SUPA_TABLE}"
+        data = json.dumps(rows).encode("utf-8")
+        req = urllib.request.Request(url, data=data, method="POST", headers={
+            "apikey": SUPABASE_KEY,
+            "Authorization": f"Bearer {SUPABASE_KEY}",
+            "Content-Type": "application/json",
+            "Prefer": "return=minimal",
+        })
+        urllib.request.urlopen(req, timeout=10).read()
+    except urllib.error.HTTPError as e:
+        try:
+            body = e.read().decode("utf-8", "replace")[:200]
+        except Exception:
+            body = "?"
+        print(f"[supabase] HTTP {e.code}: {body}", flush=True)
+    except Exception as e:
+        print(f"[supabase] kayit hatasi: {e}", flush=True)
+
+
+def _iso_utc(ts):
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ts))
+
+
 def _telegram_send(text):
     """Telegram'a mesaj gonderir. Token/chat yoksa sessizce gecer.
     Her chat_id'ye AYRI istek atilir (biri basarisiz olsa digerini etkilemez).
@@ -287,6 +360,169 @@ def _telegram_send(text):
             print(f"[telegram] chat_id={chat_id} gonderim hatasi: {e}", flush=True)
 
 
+def _early_prefilter():
+    """1. asama on eleme: bulk ticker (TEK cagri, weight 40) ile hacim deltasi.
+    Her kontrolde tum coinlerin 24h quoteVolume'u okunur; onceki kontrolle fark =
+    son ~15dk'da eklenen hacim. Delta hem kendi gecmis ortalamasinin EARLY_PRE_X
+    katini hem EARLY_PRE_MIN'i gecerse aday. Kesin karar 2. asamada (klines).
+    Donus: (aday_listesi, fiyat_map). Ilk kontrol warmup'tir (aday cikmaz)."""
+    data = http_get("https://fapi.binance.com/fapi/v1/ticker/24hr", timeout=15)
+    if not isinstance(data, list):
+        return [], {}
+    candidates = []
+    prices = {}
+    for d in data:
+        sym = d.get("symbol", "")
+        if not sym.endswith("USDT"):
+            continue
+        try:
+            qv = float(d.get("quoteVolume") or 0)
+            prices[sym] = float(d.get("lastPrice") or 0)
+        except Exception:
+            continue
+        prev = _ticker_prev.get(sym)
+        _ticker_prev[sym] = qv
+        if prev is None:
+            continue  # warmup: ilk goruste delta yok
+        delta = qv - prev
+        if delta < 0:
+            delta = 0.0  # 24h pencereden dusen eski hacim negatif gosterebilir
+        hist = _ticker_hist.setdefault(sym, [])
+        # aday testi: gecmis ortalamaya gore sicrama + mutlak esik (genis ag)
+        if hist:
+            avg = sum(hist) / len(hist)
+            if delta >= EARLY_PRE_MIN and (avg <= 0 or delta >= EARLY_PRE_X * avg):
+                candidates.append(sym)
+        elif delta >= EARLY_PRE_MIN:
+            candidates.append(sym)  # tek delta var, ortalama yok: mutlak esikle gecir
+        hist.append(delta)
+        if len(hist) > EARLY_BASE_N + 1:
+            del hist[0]
+    return candidates[:EARLY_MAX_CANDIDATES], prices
+
+
+def _early_verify(sym):
+    """2. asama kesin kontrol: klines (weight 1). Son KAPANMIS mum vs onceki 8 mum ort.
+    Sartlar (VE): hacim >= EARLY_VOL_X * ort, takerBuy >= EARLY_TB_X * ort,
+    hacim >= EARLY_MIN_VOL. Donus dict veya None.
+    Kline alanlari: [0]=acilis_ts [1]=open [4]=close [7]=quoteVol [10]=takerBuyQuote"""
+    try:
+        j = http_get(f"https://fapi.binance.com/fapi/v1/klines?symbol={sym}&interval=15m&limit={EARLY_BASE_N + 2}")
+        if not isinstance(j, list) or len(j) < EARLY_BASE_N + 2:
+            return None
+        # j[-1] = ACIK (canli) mum, j[-2] = son KAPANMIS mum, j[-10..-3] = taban 8 mum
+        closed = j[-2]
+        base = j[-(EARLY_BASE_N + 2):-2]
+        qv = float(closed[7]); tb = float(closed[10])
+        avg_qv = sum(float(k[7]) for k in base) / len(base)
+        avg_tb = sum(float(k[10]) for k in base) / len(base)
+        if qv < EARLY_MIN_VOL or avg_qv <= 0 or avg_tb <= 0:
+            return None
+        vol_x = qv / avg_qv
+        tb_x = tb / avg_tb
+        if vol_x >= EARLY_VOL_X and tb_x >= EARLY_TB_X:
+            o = float(closed[1]); c = float(closed[4])
+            chg = (c / o - 1) * 100 if o > 0 else 0.0
+            return {
+                "symbol": sym.replace("USDT", ""),
+                "volX": round(vol_x, 1), "vol": round(qv),
+                "tbX": round(tb_x, 1), "tb": round(tb),
+                "priceChg": round(chg, 1),
+                "candleTs": int(closed[0]),
+            }
+    except Exception:
+        pass
+    return None
+
+
+def _fmt_usd(v):
+    """Hacmi kisa formatlar: 386K, 4.6M."""
+    if v >= 1e6: return f"{v/1e6:.1f}M"
+    return f"{v/1e3:.0f}K"
+
+
+def _build_early_message(alerts):
+    """Erken uyari Telegram mesaji."""
+    lines = ["\u26A1 <b>ERKEN UYARI</b> \u2014 15M", ""]
+    for a in alerts:
+        lines.append(f"<b>{a['symbol']}/USDT</b> \u2014 {_fmt_price(a.get('price'))}")
+        lines.append(f"Hacim: {a['volX']:.1f}x ({_fmt_usd(a['vol'])} USDT)")
+        lines.append(f"Taker Buy: {a['tbX']:.1f}x ({_fmt_usd(a['tb'])} USDT)")
+        lines.append(f"Fiyat: {a['priceChg']:+.1f}% (15dk)")
+        lines.append("")
+    return "\n".join(lines).strip()
+
+
+def run_early_check():
+    """ERKEN UYARI kontrolu (v12): hafif, 15dk'da bir ayri cron ile calisir.
+    1. asama: bulk ticker on eleme (weight 40). 2. asama: adaylara klines (weight 1'er).
+    Toplam ~40-70 weight; futures/data butcesine DOKUNMAZ (klines ayri aile).
+    Tarama degildir - account/position/OI cekmez, 10-30 saniyede biter."""
+    with _scan_lock:
+        if _early_state["checking"]:
+            return {"ok": True, "already": True}
+        _early_state["checking"] = True
+        _early_state["error"] = None
+    try:
+        if _binance_banned():
+            with _scan_lock:
+                _early_state["error"] = "Binance banli, kontrol atlandi"
+            return {"ok": False, "error": "banli"}
+        candidates, prices = _early_prefilter()
+        alerts = []
+        for sym in candidates:
+            if _binance_banned():
+                break
+            r = _early_verify(sym)
+            if r:
+                r["price"] = prices.get(sym)
+                alerts.append(r)
+            time.sleep(0.1)  # kucuk nefes (30 aday = ~30 weight zaten dusuk)
+
+        now_ts = time.time()
+        fresh = []
+        with _scan_lock:
+            for a in alerts:
+                key = a["symbol"]
+                last = _early_notified.get(key)
+                if last is None or (now_ts - last) >= EARLY_DEDUP_SEC:
+                    fresh.append(a)
+                    _early_notified[key] = now_ts
+                    _early_alerts[key] = (now_ts, a.get("price"))
+            # pruning
+            for k in [k for k, v in _early_notified.items() if now_ts - v > EARLY_DEDUP_SEC * 2]:
+                del _early_notified[k]
+            for k in [k for k, v in _early_alerts.items() if now_ts - v[0] > EARLY_ALERT_KEEP]:
+                del _early_alerts[k]
+            _early_state["results"] = alerts
+            _early_state["ts"] = now_ts
+
+        if fresh and TELEGRAM_ENABLED:
+            _telegram_send(_build_early_message(fresh))
+
+        # v13: TUM sinyalleri Supabase'e yaz (dedup'a takilanlar dahil, notified ile ayirt edilir)
+        if alerts:
+            fresh_syms = {a["symbol"] for a in fresh}
+            _supa_log([{
+                "ts": _iso_utc(now_ts),
+                "signal_type": "EARLY",
+                "period": "15m",
+                "symbol": a["symbol"],
+                "price": a.get("price"),
+                "notified": a["symbol"] in fresh_syms,
+                "vol_x": a["volX"], "tb_x": a["tbX"],
+                "vol_usdt": a["vol"], "price_chg": a["priceChg"],
+            } for a in alerts])
+        return {"ok": True, "candidates": len(candidates), "alerts": len(alerts), "notified": len(fresh)}
+    except Exception as e:
+        with _scan_lock:
+            _early_state["error"] = str(e)
+        return {"ok": False, "error": str(e)}
+    finally:
+        with _scan_lock:
+            _early_state["checking"] = False
+
+
 def _fmt_price(p):
     """Fiyati anlamli basamakla formatlar (kucuk coinlerde 0.001938 gibi)."""
     if p is None:
@@ -297,9 +533,12 @@ def _fmt_price(p):
 
 
 def _build_pump_message(pumps, period):
-    """Patlama adaylarindan Telegram mesaji. Baslikta periyot tag'i (1H / 15M)."""
+    """Patlama adaylarindan Telegram mesaji. Baslikta periyot tag'i (1H / 15M).
+    v12: coin icin son 6 saatte erken uyari verilmisse TEYIT notu eklenir."""
     tag = "1H" if period == "1h" else "15M"
     lines = [f"\U0001F680 <b>PATLAMA</b> \u2014 {tag}", ""]
+    with _scan_lock:
+        early_snap = dict(_early_alerts)
     for r in pumps:
         sym = r["symbol"]
         oi = r.get("oiChange")
@@ -312,6 +551,16 @@ def _build_pump_message(pumps, period):
         fund_s = f"{fund:+.4f}%" if fund is not None else "n/a"
         score = r.get("signalScore", 0)
         lines.append(f"<b>{sym}/USDT</b> \u2014 {_fmt_price(r.get('price'))}")
+        ea = early_snap.get(sym)
+        if ea:
+            ea_ts, ea_price = ea
+            t = time.gmtime(ea_ts + 3 * 3600)  # TR = UTC+3
+            chg_note = ""
+            cur = r.get("price")
+            if ea_price and cur:
+                chg = (cur / ea_price - 1) * 100
+                chg_note = f", {chg:+.1f}% uyaridan beri"
+            lines.append(f"\u26A1 TEYIT: erken uyari {t.tm_hour:02d}:{t.tm_min:02d} TR ({_fmt_price(ea_price)}{chg_note})")
         lines.append(f"OI: {oi_s}{cum_s} (kontrat)")
         lines.append(f"Ayrisma: {div_s}")
         lines.append(f"Funding: {fund_s}")
@@ -521,9 +770,11 @@ def run_scan(period):
         # v11: Her iki periyotta patlama bildirimi. Baslikta tag (1H/15M) + fiyat.
         # 15m dedup: ayni coin PUMP_DEDUP_SEC icinde tekrar bildirilmez (skor artmadikca).
         # 1h dedup'suz (mevcut davranis korundu).
-        if TELEGRAM_ENABLED:
-            pumps = [r for r in results if r.get("signalType") == "PATLAMA"]
-            if period == "15m" and pumps:
+        all_pumps = [r for r in results if r.get("signalType") == "PATLAMA"]
+        notified_pumps = []
+        if TELEGRAM_ENABLED and all_pumps:
+            pumps = all_pumps
+            if period == "15m":
                 now_ts = time.time()
                 fresh = []
                 with _scan_lock:
@@ -538,8 +789,26 @@ def run_scan(period):
                     for k in [k for k, v in _pump_notified_15m.items() if v[0] < cutoff]:
                         del _pump_notified_15m[k]
                 pumps = fresh
+            notified_pumps = pumps
             if pumps:
                 _telegram_send(_build_pump_message(pumps, period))
+
+        # v13: TUM patlama sinyallerini Supabase'e yaz (backtest icin,
+        # dedup'a takilanlar dahil - notified kolonu ile ayirt edilir)
+        if all_pumps:
+            nset = {r["symbol"] for r in notified_pumps}
+            log_ts = _iso_utc(time.time())
+            _supa_log([{
+                "ts": log_ts,
+                "signal_type": "PUMP_1H" if period == "1h" else "PUMP_15M",
+                "period": period,
+                "symbol": r["symbol"],
+                "price": r.get("price"),
+                "notified": r["symbol"] in nset,
+                "oi_chg": r.get("oiChange"), "oi_cum": r.get("oiCum"),
+                "divergence": r.get("divergence"), "funding": r.get("funding"),
+                "score": r.get("signalScore", 0),
+            } for r in all_pumps])
 
         return {"ok": True, "count": len(results)}
     except Exception as e:
@@ -644,6 +913,13 @@ background:var(--amber); color:var(--bg); font-weight:700; letter-spacing:0.03em
 background:var(--green); color:var(--bg); font-weight:700; letter-spacing:0.03em; }
 .dump-badge { display:inline-block; font-size:9px; padding:2px 6px; margin-left:5px;
 background:var(--red); color:var(--bg); font-weight:700; letter-spacing:0.03em; }
+.early-box { margin-bottom:14px; padding:10px 12px; background:var(--bg-2);
+border:1px solid var(--amber); display:none; }
+.early-box.show { display:block; }
+.early-title { font-size:11px; font-weight:700; color:var(--amber); letter-spacing:0.05em; margin-bottom:8px; }
+.early-item { font-size:11px; color:var(--text); padding:3px 0; display:flex; flex-wrap:wrap; gap:10px; }
+.early-item b { color:var(--amber); min-width:70px; }
+.early-item span { color:var(--text-dim); }
 .chart-row td { padding:0; border-bottom:1px solid var(--border-strong); background:var(--bg); }
 .chart-box { padding:16px 10px; }
 .chart-box.loading { text-align:center; color:var(--text-faint); padding:30px; font-size:11px; }
@@ -695,6 +971,11 @@ thead th { padding:7px 5px; font-size:9px; }
 </div>
 
 <div class="status" id="status">Yukleniyor...</div>
+
+<div class="early-box" id="earlyBox">
+<div class="early-title">\u26A1 ERKEN UYARI \u2014 15M (hacim + taker buy patlamasi)</div>
+<div id="earlyItems"></div>
+</div>
 
 <table>
 <thead>
@@ -917,9 +1198,28 @@ function drawChart(data) {
   });
 }
 
+function renderEarly(data) {
+  const box = document.getElementById('earlyBox');
+  const items = document.getElementById('earlyItems');
+  const early = (currentPeriod === '15m' && data.early && data.early.results) ? data.early.results : [];
+  if (!early.length) { box.classList.remove('show'); items.innerHTML = ''; return; }
+  let html = '';
+  for (const a of early) {
+    html += `<div class="early-item"><b>${a.symbol}</b>
+      <span>Hacim ${a.volX}x (${fmtUsd(a.vol)})</span>
+      <span>TB ${a.tbX}x (${fmtUsd(a.tb)})</span>
+      <span>${a.priceChg>=0?'+':''}${a.priceChg}% 15dk</span></div>`;
+  }
+  items.innerHTML = html;
+  box.classList.add('show');
+}
+
+function fmtUsd(v){ return v >= 1e6 ? (v/1e6).toFixed(1)+'M' : (v/1e3).toFixed(0)+'K'; }
+
 function render(data) {
   const status = document.getElementById('status');
   allResults = data.results || [];
+  renderEarly(data);
   if (data.scanning) {
     status.innerHTML = `<span class="scanning"><span class="spin">\u29BF</span> Taraniyor... ${data.scanned||0}/${data.total||'?'} coin</span>`;
   } else if (data.error) {
@@ -1039,12 +1339,15 @@ def _scan_payload(period):
     if not st:
         return {"ok": False, "error": "gecersiz periyot"}
     with _scan_lock:
-        return {
+        payload = {
             "ok": True, "period": period, "ts": st["ts"],
             "scanning": st["scanning"], "scanned": st["scanned"],
             "total": st["total"], "error": st["error"],
             "results": st["results"],
         }
+        if period == "15m":
+            payload["early"] = {"ts": _early_state["ts"], "results": _early_state["results"]}
+        return payload
 
 
 class ScrHandler(http.server.BaseHTTPRequestHandler):
@@ -1080,6 +1383,15 @@ class ScrHandler(http.server.BaseHTTPRequestHandler):
         if path == "/api/scan":
             self._json(200, _scan_payload(period)); return
 
+        if path == "/api/early-check":
+            # v12: cron her 15dk tetikler (dakika 3,18,33,48). Kucuk cevap doner,
+            # kontrol arka planda calisir (cron-job.org "output too large" olmasin).
+            with _scan_lock:
+                busy = _early_state["checking"]
+            if not busy:
+                threading.Thread(target=run_early_check, daemon=True).start()
+            self._json(200, {"ok": True, "started": not busy}); return
+
         if path == "/api/run-scan":
             st = _scan_state[period]
             was_idle = not st["scanning"]
@@ -1103,7 +1415,7 @@ class ThreadedServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
 
 
 def main():
-    print(f"L/S Divergence Screener v11 listening on {HOST}:{PORT}", flush=True)
+    print(f"L/S Divergence Screener v13 listening on {HOST}:{PORT}", flush=True)
     try:
         with ThreadedServer((HOST, PORT), ScrHandler) as srv:
             srv.serve_forever()
