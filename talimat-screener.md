@@ -45,7 +45,9 @@ Engine ve Terminal AYRI chatlerde, AYRI talimatlarda konusulur — ASLA karistir
 - Kod degisikligine baslamadan ONCE Screener.py'yi bu adresten cek (curl ile) —
   project knowledge'daki kopya ESKI olabilir, GitHub'daki deploy edilen gercek koddur.
 - Talimatta suphe varsa (surum uyusmazligi vb.) talimati da GitHub'dan cek.
-- Claude GitHub'a YAZAMAZ — commit'i kullanici yapar (web UI veya ileride Claude Code).
+- Claude token ile YAZAMAZ; ama Chrome uzerinden (kullanici GitHub'da oturum acikken,
+  kullanici onayiyla) dosya olusturup/duzenleyip commit EDEBILIR. Varsayilan: kullanici
+  commit eder; kullanici isterse "GitHub'a sen yukle" der, Claude Chrome ile yapar.
 
 ## PROJE BILGILERI
 - **Dosya:** Screener.py (isim ASLA degismez)
