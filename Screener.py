@@ -303,7 +303,7 @@ def _build_pump_message(pumps, period):
     for r in pumps:
         sym = r["symbol"]
         oi = r.get("oiChange")
-        oi_s = f"+{oi:.1f}%" if oi is not None else "n/a"
+        oi_s = f"{oi:+.1f}%" if oi is not None else "n/a"
         cum = r.get("oiCum")
         cum_s = f" (3 mum: +{cum:.1f}%)" if cum is not None and cum > 0 else ""
         div = r["divergence"]
