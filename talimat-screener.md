@@ -55,7 +55,7 @@ Engine ve Terminal AYRI chatlerde, AYRI talimatlarda konusulur — ASLA karistir
 - **Altyapi:** Hetzner VPS Nuremberg, Coolify, Port Mapping 8766:8766
 - **Erisim:** http://178.104.143.245:8766 (sslip.io telefonda engelli — IP:port kullan)
 - **Start:** python Screener.py
-- **Guncel surum:** v13
+- **Guncel surum:** v14
 
 ### Surum gecmisi (ozet)
 - v3: Ban duzeltmeleri (premiumIndex toplu cagri, batch 5, throttle, exchangeInfo 6h cache)
@@ -70,6 +70,7 @@ Engine ve Terminal AYRI chatlerde, AYRI talimatlarda konusulur — ASLA karistir
   15m bildirimi + 2h dedup, baslikta tag (1H/15M), mesajda fiyat
 - v12: ERKEN UYARI sistemi (hacim + taker buy patlamasi, ayri hafif cron)
 - v13: Supabase sinyal kaydi (backtest icin, screener_signals tablosu)
+- v14: ERKEN UYARI sadece kripto perp (TRADIFI_PERPETUAL/tokenize hisse elenir)
 
 ## NE YAPAR
 Tum USDT futures coinleri (~400) tarar; account(kalabalik) vs position(para)
@@ -109,6 +110,9 @@ yalan soylemesin diye (B coin dersi: tek mum carpani 2-3x kalir, ortalamaya gore
   deltasi → delta >= 3x kendi ortalamasi VE >= 40K → aday (genis ag, max 30 aday)
 - 2. asama: sadece adaylara klines 15m limit=10 (weight 1/coin) → kesin kontrol
 - Toplam ~40-70 weight/kontrol; futures/data butcesine DOKUNMAZ. Ilk kontrol warmup.
+- KAPSAM (v14): SADECE kripto perpetual. ticker/24hr, TRADIFI_PERPETUAL tokenize
+  hisse perp'lerini de (IREN vb, underlyingType=EQUITY) dondurur — adaylar
+  get_usdt_symbols() setiyle suzulur, hisseler ELENIR. Hisselerle isimiz YOK.
 
 Dogrulama (4 coin): AKE atesleme mumu OK, BANK atesleme OK, B kalkistan 2 saat once OK,
 TLM dipten donus mumu OK (+%77 oncesi).
@@ -122,6 +126,8 @@ Dashboard 15m sekmesinde ERKEN UYARI kutusu.
 - Her EARLY ve PATLAMA sinyali aninda screener_signals tablosuna TEK INSERT.
 - Dedup'a takilanlar DA kaydedilir — notified kolonu ayirt eder.
 - Env: SUPABASE_URL + SUPABASE_KEY (service_role; Engine ile ayni proje/degerler).
+  SUPABASE_URL'e /rest/v1 EKLEME — kod kendi ekler (eklenirse PGRST125 404 hatasi;
+  yasandi, duzeltildi). Dogru format: https://xyz.supabase.co
   Env yoksa SESSIZCE atlanir, davranis degismez.
 - RLS disabled (Engine kalibi). Sonuc olcumu kayit aninda YAPILMAZ —
   backtest analizinde toptan cekilir (Secenek A: analiz aninda klines'tan +1h/+4h/+24h).
@@ -205,7 +211,7 @@ cron-job.org'un "failure on silence" durumunu onlemek icin.
 ## DEPLOY (kullaniciya hatirlat)
 - GitHub ls-screener reposu → Screener.py → tumunu sec → sil → yeni kodu yapistir → TEK commit
 - Coolify otomatik deploy eder (Dockerfile mevcut)
-- Deploy sonrasi loglarda "v13 listening" gor = dogrulama
+- Deploy sonrasi loglarda "v14 listening" gor = dogrulama
 - Erisim: http://178.104.143.245:8766
 - Env listesi (Coolify): TELEGRAM_TOKEN, TELEGRAM_CHAT_IDS, SUPABASE_URL, SUPABASE_KEY
 
