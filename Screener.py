@@ -1,5 +1,5 @@
 """
-L/S DIVERGENCE SCREENER (v15)
+L/S DIVERGENCE SCREENER (v16)
 =============================
 Binance futures'taki TUM USDT coinleri tarar; account(kalabalik) vs
 position(para) ayrismasi + ERKEN SINYAL (patlama/dusus adayi) tespiti.
@@ -24,6 +24,14 @@ v11: ERKEN YAKALAMA - (1) PATLAMA kapisi: son mum VEYA son 3 mum kumulatif OI
    (3) Bildirimde son fiyat (premiumIndex markPrice - ayni cagri, ekstra istek yok).
    (4) 15m dedup: ayni coin 2 saat icinde tekrar bildirilmez (skor artmadikca).
        1h dedup'suz kaldi (mevcut davranis).
+v16: PATLAMA GUC KADEMESI (3 seviye, backtest %42 vs %30 dogrulamali):
+   💵 GUCLU = erken uyari teyidi VAR + ayrisma > 0 + skor 3/3 (BANK/AKE profili:
+      once 15m erken uyari, sonra patlama, whale long, funding negatif)
+   ⚪ ZAYIF = ayrisma < -15 (whale katilmiyor; v15'teki inline etiket ayri satira tasindi)
+   🟡 NORMAL = gerisi
+   Kademe coin adinin altinda AYRI SATIR (Telegram), dashboard badge'de ikon,
+   Supabase'e strength kolonu (strong/weak/normal - ALTER TABLE gerekli).
+   Sinyal uretimi DEGISMEDI - sadece etiket. Ekstra istek YOK.
 v15: BACKTEST OPTIMIZASYONU (8 gun / 1917 erken uyari analizi):
    (1) ERKEN UYARI hacim tabani 100K->250K USDT (isabet tepe>=20% orani %16->%22,
        gurultunun yarisi elenir). Carpan esikleri (5x) DEGISMEDI - backtest'te carpan
@@ -554,6 +562,24 @@ def _fmt_price(p):
     return f"{p:.8f}".rstrip("0")
 
 
+def _pump_strength(r, early_snap):
+    """PATLAMA guc kademesi (v16). Donus: "strong" / "weak" / "normal".
+    ZAYIF:  ayrisma < -15 (whale katilmiyor, retail FOMO; backtest tepe>=20% %17)
+    GUCLU:  erken uyari teyidi VAR + ayrisma > 0 + skor 3/3
+            (backtest: bu kombinasyon tepe>=20% %42, genel %30 - en iyi ayrim.
+             Teyit sart: BANK/AKE profili = once 15m erken uyari, sonra patlama)
+    NORMAL: gerisi.
+    Cakisma imkansiz: skor 3 -> whale long -> ayrisma > 0 -> asla < -15 olamaz."""
+    div = r.get("divergence")
+    if div is not None and div < PUMP_WEAK_DIV:
+        return "weak"
+    if (div is not None and div > 0
+            and r.get("signalScore", 0) == 3
+            and r["symbol"] in early_snap):
+        return "strong"
+    return "normal"
+
+
 def _build_pump_message(pumps, period):
     """Patlama adaylarindan Telegram mesaji. Baslikta periyot tag'i (1H / 15M).
     v12: coin icin son 6 saatte erken uyari verilmisse TEYIT notu eklenir."""
@@ -569,12 +595,18 @@ def _build_pump_message(pumps, period):
         cum_s = f" (3 mum: +{cum:.1f}%)" if cum is not None and cum > 0 else ""
         div = r["divergence"]
         div_s = f"{'+' if div >= 0 else ''}{div}"
-        # v15: ayrisma cok negatifse whale katilmiyor - zayif uyarisi
-        weak_s = "  \u26A0 zayif (whale katilmiyor)" if div is not None and div < PUMP_WEAK_DIV else ""
         fund = r.get("funding")
         fund_s = f"{fund:+.4f}%" if fund is not None else "n/a"
         score = r.get("signalScore", 0)
         lines.append(f"<b>{sym}/USDT</b> \u2014 {_fmt_price(r.get('price'))}")
+        # v16: guc kademesi ayri satir - 💵 GUCLU / 🟡 NORMAL / ⚪ ZAYIF
+        strength = r.get("strength") or _pump_strength(r, early_snap)
+        if strength == "strong":
+            lines.append("\U0001F4B5 <b>GUCLU</b>")
+        elif strength == "weak":
+            lines.append("\u26AA ZAYIF (whale katilmiyor)")
+        else:
+            lines.append("\U0001F7E1 NORMAL")
         ea = early_snap.get(sym)
         if ea:
             ea_ts, ea_price = ea
@@ -586,7 +618,7 @@ def _build_pump_message(pumps, period):
                 chg_note = f", {chg:+.1f}% uyaridan beri"
             lines.append(f"\u26A1 TEYIT: erken uyari {t.tm_hour:02d}:{t.tm_min:02d} TR ({_fmt_price(ea_price)}{chg_note})")
         lines.append(f"OI: {oi_s}{cum_s} (kontrat)")
-        lines.append(f"Ayrisma: {div_s}{weak_s}")
+        lines.append(f"Ayrisma: {div_s}")
         lines.append(f"Funding: {fund_s}")
         lines.append(f"Skor: {score}/3")
         lines.append("")
@@ -795,6 +827,12 @@ def run_scan(period):
         # 15m dedup: ayni coin PUMP_DEDUP_SEC icinde tekrar bildirilmez (skor artmadikca).
         # 1h dedup'suz (mevcut davranis korundu).
         all_pumps = [r for r in results if r.get("signalType") == "PATLAMA"]
+        # v16: guc kademesi hesapla (dashboard + Telegram + Supabase ayni degeri kullanir)
+        if all_pumps:
+            with _scan_lock:
+                _early_snap = dict(_early_alerts)
+            for r in all_pumps:
+                r["strength"] = _pump_strength(r, _early_snap)
         notified_pumps = []
         if TELEGRAM_ENABLED and all_pumps:
             pumps = all_pumps
@@ -832,6 +870,7 @@ def run_scan(period):
                 "oi_chg": r.get("oiChange"), "oi_cum": r.get("oiCum"),
                 "divergence": r.get("divergence"), "funding": r.get("funding"),
                 "score": r.get("signalScore", 0),
+                "strength": r.get("strength", "normal"),
             } for r in all_pumps])
 
         return {"ok": True, "count": len(results)}
@@ -1134,8 +1173,10 @@ function renderTable() {
     const deepen = r.deepening ? `<span class="deepen-badge" title="Derinlesen ayrisma">\u21E3${r.deepenDelta!=null?r.deepenDelta:''}</span>` : '';
     let signal = '';
     if (r.signalType === 'PATLAMA') {
-      const weak = (r.divergence != null && r.divergence < -15) ? '\u26A0' : '';
-      signal = `<span class="pump-badge" title="Patlama adayi${weak?' - zayif: whale katilmiyor':''}">🚀${r.signalScore}${weak}</span>`;
+      const st = r.strength || 'normal';
+      const ico = st === 'strong' ? '\U0001F4B5' : (st === 'weak' ? '\u26AA' : '\U0001F7E1');
+      const ttl = st === 'strong' ? 'GUCLU: teyit + whale + skor 3' : (st === 'weak' ? 'ZAYIF: whale katilmiyor' : 'Normal patlama adayi');
+      signal = `<span class="pump-badge" title="${ttl}">🚀${r.signalScore}${ico}</span>`;
     }
     else if (r.signalType === 'DUSUS') signal = `<span class="dump-badge" title="Dusus adayi">📉${r.signalScore}</span>`;
     const isOpen = openCoin && openCoin.symbol === r.symbol;
@@ -1442,7 +1483,7 @@ class ThreadedServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
 
 
 def main():
-    print(f"L/S Divergence Screener v15 listening on {HOST}:{PORT}", flush=True)
+    print(f"L/S Divergence Screener v16 listening on {HOST}:{PORT}", flush=True)
     try:
         with ThreadedServer((HOST, PORT), ScrHandler) as srv:
             srv.serve_forever()
