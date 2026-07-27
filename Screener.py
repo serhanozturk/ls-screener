@@ -1,5 +1,5 @@
 """
-L/S DIVERGENCE SCREENER (v14)
+L/S DIVERGENCE SCREENER (v15)
 =============================
 Binance futures'taki TUM USDT coinleri tarar; account(kalabalik) vs
 position(para) ayrismasi + ERKEN SINYAL (patlama/dusus adayi) tespiti.
@@ -24,6 +24,15 @@ v11: ERKEN YAKALAMA - (1) PATLAMA kapisi: son mum VEYA son 3 mum kumulatif OI
    (3) Bildirimde son fiyat (premiumIndex markPrice - ayni cagri, ekstra istek yok).
    (4) 15m dedup: ayni coin 2 saat icinde tekrar bildirilmez (skor artmadikca).
        1h dedup'suz kaldi (mevcut davranis).
+v15: BACKTEST OPTIMIZASYONU (8 gun / 1917 erken uyari analizi):
+   (1) ERKEN UYARI hacim tabani 100K->250K USDT (isabet tepe>=20% orani %16->%22,
+       gurultunun yarisi elenir). Carpan esikleri (5x) DEGISMEDI - backtest'te carpan
+       yukseltmek isabeti artirmadi (hatta 20x'te dustu); ayirt eden sey mutlak hacim.
+   (2) PATLAMA ayrisma < -15 "zayif" etiketi (Telegram + dashboard): whale katilmiyor,
+       retail FOMO. backtest: bu grup tepe>=20% %17, ayrisma>=0 grubu %34. ELENMEZ,
+       isaretlenir (ornek 29 sinyal, kucuk - birkac hafta daha dogrulanacak).
+   OI esigi (%10) ve OI derecelendirmesi DEGISMEDI - OI<->yukselis korelasyonu ~0
+   (kapi ise yariyor: gecen %30 vs gecemeyen %15, ama kapi sonrasi OI% derecesi onemsiz).
 v14: ERKEN UYARI sadece KRIPTO perpetual tarar - ticker/24hr'daki TRADIFI_PERPETUAL
    (tokenize hisse: IREN, vb. underlyingType=EQUITY) sembolleri elenir.
    Filtre: aday sembol get_usdt_symbols() setinde olmali (6h cache, ekstra istek yok).
@@ -106,11 +115,16 @@ PUMP_DEDUP_SEC = 7200     # 15m patlama dedup: ayni coin 2 saat icinde tekrar bi
 OI_DUMP_MIN = 2.0         # DUSUS OI esigi % (oi_chg <= -2, ralli bitiyor)
 FUNDING_HIGH = 0.05       # dusus: funding bu degerin ustu = asiri long kaldirac
 SCORE_CANDIDATE = 2       # >=2 aday, 3 guclu
+PUMP_WEAK_DIV = -15.0     # v15: ayrisma < -15 olan PATLAMA "zayif" (whale katilmiyor, retail FOMO).
+                          # backtest: bu grup tepe>=20% orani %17 iken ayrisma>=0 grubu %34.
+                          # ELENMEZ, sadece etiketlenir (ornek kucuk, birkac hafta daha dogrulanacak).
 
 # ===== ERKEN UYARI esikleri (v12) =====
 EARLY_VOL_X = 5.0         # mum hacmi >= 5x son 8 mum ortalamasi
 EARLY_TB_X = 5.0          # taker buy >= 5x son 8 mum ortalamasi
-EARLY_MIN_VOL = 100_000   # mutlak taban: mum hacmi >= 100K USDT (olu coin filtresi)
+EARLY_MIN_VOL = 250_000   # mutlak taban: mum hacmi >= 250K USDT (olu coin filtresi)
+                          # v15: 100K->250K backtest optimizasyonu (isabet %16->%22,
+                          # gurultunun yarisi elenir; carpan yukseltmek ISE YARAMIYOR - hacim tabani yariyor)
 EARLY_BASE_N = 8          # taban ortalamasi mum sayisi (2 saat)
 EARLY_DEDUP_SEC = 7200    # ayni coin 2 saat icinde tekrar bildirilmez
 EARLY_ALERT_KEEP = 21600  # erken uyari kaydi 6 saat tutulur (PATLAMA teyit referansi icin)
@@ -555,6 +569,8 @@ def _build_pump_message(pumps, period):
         cum_s = f" (3 mum: +{cum:.1f}%)" if cum is not None and cum > 0 else ""
         div = r["divergence"]
         div_s = f"{'+' if div >= 0 else ''}{div}"
+        # v15: ayrisma cok negatifse whale katilmiyor - zayif uyarisi
+        weak_s = "  \u26A0 zayif (whale katilmiyor)" if div is not None and div < PUMP_WEAK_DIV else ""
         fund = r.get("funding")
         fund_s = f"{fund:+.4f}%" if fund is not None else "n/a"
         score = r.get("signalScore", 0)
@@ -570,7 +586,7 @@ def _build_pump_message(pumps, period):
                 chg_note = f", {chg:+.1f}% uyaridan beri"
             lines.append(f"\u26A1 TEYIT: erken uyari {t.tm_hour:02d}:{t.tm_min:02d} TR ({_fmt_price(ea_price)}{chg_note})")
         lines.append(f"OI: {oi_s}{cum_s} (kontrat)")
-        lines.append(f"Ayrisma: {div_s}")
+        lines.append(f"Ayrisma: {div_s}{weak_s}")
         lines.append(f"Funding: {fund_s}")
         lines.append(f"Skor: {score}/3")
         lines.append("")
@@ -1117,7 +1133,10 @@ function renderTable() {
     const conflict = r.fundingConflict ? '<span class="conflict-badge" title="Funding celiskisi">\u26A1</span>' : '';
     const deepen = r.deepening ? `<span class="deepen-badge" title="Derinlesen ayrisma">\u21E3${r.deepenDelta!=null?r.deepenDelta:''}</span>` : '';
     let signal = '';
-    if (r.signalType === 'PATLAMA') signal = `<span class="pump-badge" title="Patlama adayi">🚀${r.signalScore}</span>`;
+    if (r.signalType === 'PATLAMA') {
+      const weak = (r.divergence != null && r.divergence < -15) ? '\u26A0' : '';
+      signal = `<span class="pump-badge" title="Patlama adayi${weak?' - zayif: whale katilmiyor':''}">🚀${r.signalScore}${weak}</span>`;
+    }
     else if (r.signalType === 'DUSUS') signal = `<span class="dump-badge" title="Dusus adayi">📉${r.signalScore}</span>`;
     const isOpen = openCoin && openCoin.symbol === r.symbol;
     html += `<tr class="data-row${isOpen?' open':''}" data-coin="${r.symbol}">
@@ -1423,7 +1442,7 @@ class ThreadedServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
 
 
 def main():
-    print(f"L/S Divergence Screener v14 listening on {HOST}:{PORT}", flush=True)
+    print(f"L/S Divergence Screener v15 listening on {HOST}:{PORT}", flush=True)
     try:
         with ThreadedServer((HOST, PORT), ScrHandler) as srv:
             srv.serve_forever()
